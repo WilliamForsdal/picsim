@@ -18,30 +18,9 @@ reset_vector:
 main:
 
 main_loop:
-    movlw       0x0
-    movlw       0x1
-    movlw       0x2
-    movlw       0x3
-    movlw       0x4
-    movlw       0x5
-    movlw       0x6
-    movlw       0x7
-    nop
-    nop
-    movlw       0x0
-    movlw       0x1
-    movlw       0x2
-    movlw       0x3
-    movlw       0x4
-    movlw       0x5
-    movlw       0x6
-    movlw       0x7
-    nop
-    nop
-    movlw       0x0
-    movlw       0x1
-    movlw       0x2
-    movlw       0x3
+    movlw       0xff
+    movwf       0x10
+    incfsz      0x10, f
     movlw       0x4
     movlw       0x5
     movlw       0x6
@@ -49,6 +28,13 @@ main_loop:
     goto        main_loop
 
 func:
+    goto        testwtf
+func1:
     retlw       5
+
+
+testwtf:
+    movlw       0xaa
+    goto        func1
 
 end reset_vector

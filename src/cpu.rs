@@ -4,12 +4,11 @@ use ihex::{Reader, Record};
 pub struct CPU {
     
     // Some instructions take 2 cycles and updates pc on the next cycle
-    pub next_cycle_pc: Option<u16>, 
     pub nop_next: bool,
 
     pub last_executed_op: Option<OpCode>,
 
-    //pub fetched: Option<OpCode>,
+    pub next_op: Option<OpCode>,
 
     pub cfg_word: u16,
     pub flash: [u16;512], // actually 12 bit words
@@ -88,16 +87,16 @@ impl CPU {
 
 
         let cpu = CPU {
-            next_cycle_pc: None,
             nop_next: false,
             last_executed_op: None,
+            next_op: None,
 
             cfg_word,
             flash,
             sram: [0;32],
             stack: [0;2],
             
-            w: 0b11111110, // contains "calibration" value
+            w: 0,           // will be overwritten with calibration value at reset
             pc: 511,
             trisgpio: 0b11_1111,
             option: 0xff,
@@ -112,7 +111,6 @@ impl CPU {
             fsr: 0b1110_0000,      // FSR    111x xxxx
             osccal: 0b1111_1111,   // OSCCAL 111x xxxx
             gpio: 0b0000_0000,     // GPIO   111x xxxx
-
         };
 
         return cpu;
@@ -153,6 +151,9 @@ impl CPU {
        }
    }
 
+   fn fetch(&self, pc: u16) -> u16 {
+        self.flash[(pc & 0x1ff) as usize]
+   }
 
     // Ticks 4 clock cycles
     pub fn tick(&mut self) {
@@ -161,19 +162,56 @@ impl CPU {
         // a NOP after a negative test
         if self.nop_next {
             self.nop_next = false;
-            self.nop();
-            self.last_executed_op = Some(OpCode::NOP);
+            self.next_op = None;
             self.pc += 1;
+        }
+
+        // next_op is None first cycle after start,
+        // or after a branching instruction
+        if self.next_op.is_none() {
+            let current_pc_instruction: u16 = self.fetch(self.pc);
+            let next_op_code: OpCode = CPU::decode_instruction(current_pc_instruction);
+            self.next_op = Some(next_op_code);
+            self.last_executed_op = None;
             return;
         }
 
-        // Handle second part of 2 cycle instruction
-        if let Some(new_pc) = self.next_cycle_pc {
-            self.next_cycle_pc = None;
-            self.last_executed_op = None;
-            self.pc = new_pc;
-            return;
+        let instruction = self.fetch(self.pc+1);
+
+        // decode
+        let next_op_code: OpCode = CPU::decode_instruction(instruction);
+        
+
+        let op_code = self.next_op.unwrap();
+        self.next_op = Some(next_op_code);
+
+        let pc_before = self.pc; // save pcl if it is changed by an instruction
+        let pcl_before = self.pcl;
+        // execute
+        self.execute_op_code(op_code);
+        // save last op-code for debugging
+        self.last_executed_op = Some(op_code);
+
+        // check writes to PCL. Should update PC
+        if pcl_before != self.pcl {
+             // PCL was written to during running
+             // update PC
+             self.pc = self.pcl as u16;
         }
+
+        // If PC was changed, throw away the next instruction
+        if self.pc != pc_before {
+            self.next_op = None; // clear next instruction
+        }
+        else {
+            self.pc += 1; // increase PC as usual
+        }
+
+        // Wrap around if we index outside
+        self.pc &= 0x1ff;
+        
+        // update sfr
+        self.pcl = (self.pc & 0xff) as u8;
 
         // update sram to reflect SFRs
         // This is so instructions can read sram directly
@@ -185,43 +223,6 @@ impl CPU {
         self.sram[FSR] = self.fsr;
         self.sram[OSCCAL] = self.osccal;
         self.sram[GPIO] = self.gpio;
-
-        // fetch instruction
-        let instruction: u16 = self.flash[self.pc as usize];
-
-        // decode
-        let op_code: OpCode = CPU::decode_instruction(instruction);
-        
-        let pcl_before = self.pcl; // save pcl if it is changed by an instruction
-
-        // execute
-        self.execute_op_code(op_code);
-        // save last op-code for debugging
-        self.last_executed_op = Some(op_code);
-
-
-        // check writes to PCL. Should update PC
-        if self.next_cycle_pc.is_some() {
-            // Don't update PC. Next cycle should do that.
-        }
-        else if self.pcl != pcl_before {
-            // wrote to pcl. should update pc
-            // PIC12F508 only allows computed jumps to pc=0-255: bit8 is always cleared
-            self.pc = self.pcl as u16;
-
-            // Any program branch flushes the currently fetched instruction
-            // So even a movf -> pcl will take 2 cycles.
-            self.nop_next = true; 
-        }
-        else {
-            self.pc += 1; // increase PC as usual
-        }
-
-        // Wrap around if we index outside
-        self.pc &= 0x1ff;
-        
-        // update sfr
-        self.pcl = (self.pc & 0xff) as u8;
         
     }
 
@@ -341,10 +342,10 @@ impl CPU {
     fn addwf(&mut self, f: u8, d: bool) {
         let a = self.sram[f as usize];
         let b = self.w;
-        let result: u32 = a as u32 + b as u32;
-        self.affect_carry(result > 255);
-        self.affect_zero(result % 256 == 0);
-        self.affect_dc(a & 0xf + b & 0xf > 15);
+        let (result, overflow) = a.overflowing_add(b);
+        self.affect_carry(overflow);
+        self.affect_zero(result == 0);
+        self.affect_dc((a & 0xf + b & 0xf) > 15);
 
         if d {
             self.write(f, result as u8);
@@ -387,7 +388,7 @@ impl CPU {
     }
 
     fn decf(&mut self, f: u8, d: bool) {
-        let result = self.sram[f as usize] - 1;
+        let (result, _) = self.sram[f as usize].overflowing_sub(1);
         if d {
             self.write(f, result);
         }
@@ -398,7 +399,7 @@ impl CPU {
     }
 
     fn decfsz(&mut self, f: u8, d: bool) {
-        let result = self.sram[f as usize] - 1;
+        let (result, _) = self.sram[f as usize].overflowing_sub(1);
         if d {
             self.write(f, result);
         }
@@ -412,7 +413,7 @@ impl CPU {
     }
 
     fn incf(&mut self, f: u8, d: bool) {
-        let result = self.sram[f as usize] + 1;
+        let (result, _) = self.sram[f as usize].overflowing_add(1);
         if d {
             self.write(f, result);
         }
@@ -423,15 +424,16 @@ impl CPU {
     }
 
     fn incfsz(&mut self, f: u8, d: bool) {
-        let result = self.sram[f as usize] + 1;
+        let (result, overflow) = self.sram[f as usize].overflowing_add(1);
         if d {
             self.write(f, result);
         }
         else {
             self.w = result;
         }
+
         // If result is 0, execute a nop instead of next instruction
-        if result == 0 {
+        if overflow {
             self.nop_next = true;
         }
     }
@@ -503,9 +505,9 @@ impl CPU {
     fn subwf(&mut self, f: u8, d: bool) {
         let a = self.sram[f as usize];
         let b = self.w;
-        let result = a - b;
-        self.affect_carry(b > a);
-        self.affect_zero(b == a);
+        let (result, overflow) = a.overflowing_sub(b);
+        self.affect_carry(overflow);
+        self.affect_zero(result == 0);
         self.affect_dc(a & 0xf < b & 0xf); // not sure about this one
         if d {
             self.write(f, result);
@@ -569,8 +571,8 @@ impl CPU {
     fn call(&mut self, k: u8) {
         self.stack[1] = self.stack[0];
         self.stack[0] = self.pc + 1;
-        let new_pc = k as u16 | ((self.status & 0b0110_0000) as u16) << 4;
-        self.next_cycle_pc = Some(new_pc);
+        let new_pc = k as u16; // can only call first 256 indexes
+        self.pc = new_pc;
     }
 
     fn clrwdt(&mut self) {
@@ -578,10 +580,7 @@ impl CPU {
     }
 
     fn goto(&mut self, k: u16) {
-        let new_pc = k;
-        // We don't use paging on PIC12F508
-        //new_pc |= (self.status() as u16 & 0b0011_0000) << 4;
-        self.next_cycle_pc = Some(new_pc);
+        self.pc = k;
     }
 
     fn iorlw(&mut self, k: u8) {
@@ -597,9 +596,9 @@ impl CPU {
     }
 
     fn retlw(&mut self, k: u8) {
-        // Pop stack and set pc next cycle
+        // Pop stack and update pc
         self.w = k;
-        self.next_cycle_pc = Some(self.stack[0]);
+        self.pc = self.stack[0];
         self.stack[0] = self.stack[1];
     }
 
@@ -670,9 +669,6 @@ impl CPU {
         // Writing to GPIO sets outputs
         self.output_buffer = value & !self.trisgpio;
     }
-
-
-
 
 }
 
