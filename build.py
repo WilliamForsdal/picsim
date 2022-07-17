@@ -32,11 +32,11 @@ def main():
         print (call)
         print(subprocess.call(call))
 
-    # for f in [os.path.join("obj", f) for f in os.listdir("obj") if os.path.isfile(os.path.join("obj", f)) if not f.endswith("hex")]:
-    #     try:
-    #         os.remove(f)
-    #     except:
-    #         print("Failed to remove file " + f)
+    for f in [os.path.join("obj", f) for f in os.listdir("obj") if os.path.isfile(os.path.join("obj", f)) if not f.endswith("hex")]:
+        try:
+            os.remove(f)
+        except:
+            print("Failed to remove file " + f)
 
 if __name__ == "__main__":
     print("main")

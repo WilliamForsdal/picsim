@@ -35,23 +35,33 @@ pub struct FSRs {
     osccal: u8,
     gpio: u8,
 }
-impl FSRs {
-    fn update_self(&mut self, cpu: &CPU) {
-        let status_w_mask = 0b11100111;
-        self.status = (self.status & !status_w_mask) | (cpu.sram[STATUS] & status_w_mask);
-    }
-    fn update_cpu(&mut self, cpu: &CPU) {
 
-    }
-}
-
-// const INDF: usize = 0;
-// const TMR0: usize = 1;
+const INDF: usize = 0;
+const TMR0: usize = 1;
 const PCL: usize = 2;
 const STATUS: usize = 3;
-// const FSR: usize = 4;
-// const OSCCAL: usize = 5;
-// const GPIO: usize = 6;
+const FSR: usize = 4;
+const OSCCAL: usize = 5;
+const GPIO: usize = 6;
+
+impl FSRs {
+    fn update(&mut self, cpu: &CPU) {
+
+        self.fsr = cpu.sram[FSR];
+        if self.fsr == INDF as u8 {
+            self.indf = 0; // Reading indf indirectly produces 00h
+        }
+        else {
+            
+        }
+
+        let status_w_mask = 0b11100111;
+        self.status = (self.status & !status_w_mask) | (cpu.sram[STATUS] & status_w_mask);
+
+
+    }
+
+}
 
 impl CPU {
 
