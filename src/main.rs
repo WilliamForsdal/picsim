@@ -6,9 +6,9 @@ fn main() {
     let contents = fs::read_to_string("obj/main.hex").unwrap();
     let mut cpu: CPU = CPU::new(&contents);
     println!("w:{}, pc:{:3}, z:{}, c:{}", cpu.w, cpu.pc, cpu.status_z(), cpu.status_c());
-    for i in 0..10 {
+    for i in 0..100 {
         cpu.tick();
-        println!("{i:03} pc: {:03} W: 0x{:02X} executed: {:?} ", cpu.pc, cpu.w, cpu.prev_op);
+        println!("{i:03} pc: {:03} W: 0x{:02X} executed: {:?} ", cpu.pc, cpu.w, cpu.last_executed_op);
     }
 
 }

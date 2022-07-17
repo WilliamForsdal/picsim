@@ -7,11 +7,16 @@ pub struct CPU {
     pub next_cycle_pc: Option<u16>, 
     pub nop_next: bool,
 
-    pub prev_op: Option<OpCode>,
+    //pub last_executed_op: Option<OpCode>,
+
+    pub fetched: Option<OpCode>,
 
     pub cfg_word: u16,
     pub flash: [u16;512], // actually 12 bit words
-    pub sram: [u8;32],
+    
+
+    pub sram: [u8;32], // lower 6 not used, SRFs
+
     pub stack: [u16;2],
 
     pub w: u8,
@@ -19,49 +24,26 @@ pub struct CPU {
     pub option: u8,     
     pub trisgpio: u8, // not a memory mapped register
 
-    pub output_buffer: u8, // store output buffer data. writes to sram[6] sets bits here
     pub input_buffer: u8, // store input data
+    pub output_buffer: u8,
 
-    pub fsrs: FSRs,
+    
+    pub indf: u8,
+    pub tmr0: u8,
+    pub pcl: u8,
+    pub status: u8,
+    pub fsr: u8,
+    pub osccal: u8,
+    pub gpio: u8,
 }
 
-#[derive(Default, Debug)]
-pub struct FSRs {
-    indf: u8,
-    tmr0: u8,
-    pcl: u8,
-    status: u8,
-    fsr: u8,
-    osccal: u8,
-    gpio: u8,
-}
-
-const INDF: usize = 0;
-const TMR0: usize = 1;
-const PCL: usize = 2;
-const STATUS: usize = 3;
-const FSR: usize = 4;
-const OSCCAL: usize = 5;
-const GPIO: usize = 6;
-
-impl FSRs {
-    fn update(&mut self, cpu: &CPU) {
-
-        self.fsr = cpu.sram[FSR];
-        if self.fsr == INDF as u8 {
-            self.indf = 0; // Reading indf indirectly produces 00h
-        }
-        else {
-            
-        }
-
-        let status_w_mask = 0b11100111;
-        self.status = (self.status & !status_w_mask) | (cpu.sram[STATUS] & status_w_mask);
-
-
-    }
-
-}
+const INDF:    usize = 0;
+const TMR0:    usize = 1;
+const PCL:     usize = 2;
+const STATUS:  usize = 3;
+const FSR:     usize = 4;
+const OSCCAL:  usize = 5;
+const GPIO:    usize = 6;
 
 impl CPU {
 
@@ -105,10 +87,10 @@ impl CPU {
         flash[511] = 0x0205; // MOVF OSCCAL, w
 
 
-        let mut cpu = CPU {
+        let cpu = CPU {
             next_cycle_pc: None,
             nop_next: false,
-            prev_op: None,
+            last_executed_op: None,
 
             cfg_word,
             flash,
@@ -123,58 +105,54 @@ impl CPU {
             input_buffer: 0,
             output_buffer: 0,
 
-            fsrs: FSRs::default(),
-        };
+            indf: 0,               // INDF   xxxx xxxx
+            tmr0: 0,               // tmr0   xxxx xxxx
+            pcl: 0b11111111,       // PC     1111 1111
+            status: 0b0001_1000,   // STATUS 1111 1xxx
+            fsr: 0b1110_0000,      // FSR    111x xxxx
+            osccal: 0b1111_1111,   // OSCCAL 111x xxxx
+            gpio: 0b0000_0000,     // GPIO   111x xxxx
 
-        cpu.sram[0] = 0x55; // INDF             xxxx xxxx
-        cpu.sram[1] = 0x55; // tmr0             xxxx xxxx
-        cpu.sram[2] = 0; //         PC          1111 1111, TODO set to 0b1111_1111 and execute a single movf
-        cpu.sram[3] = 0b0001_1000; // STATUS    1111 1xxx
-        cpu.sram[4] = 0b1110_0000; // FSR       111x xxxx
-        cpu.sram[5] = 0b1111_1111; // OSCCAL    111x xxxx
-        cpu.sram[6] = 0b0000_0000; // GPIO      111x xxxx
+        };
 
         return cpu;
     }
 
-    pub fn status(&self) -> u8 {
-        self.sram[STATUS]
-    }
-
     pub fn status_z(&self) -> bool {
-        (self.sram[STATUS] & 0b100)  > 0
+        (self.status & 0b100)  > 0
     }
 
     pub fn status_c(&self) -> bool {
-        (self.sram[STATUS] & 0b10)  > 0
+        (self.status & 0b10)  > 0
     }
 
     fn affect_zero(&mut self, val: bool) {
         if val {
-           self.sram[3] |= 0b100;
+            self.status |= 0b100;
        }
        else {
-           self.sram[3] &= !0b100;
+            self.status &= !0b100;
        }
    }
    
    fn affect_dc(&mut self, val: bool) {
        if val {
-          self.sram[3] |= 0b10;
+            self.status |= 0b10;
       }
       else {
-          self.sram[3] &= !0b10;
+            self.status &= !0b10;
       }
   }
 
    fn affect_carry(&mut self, val: bool) {
         if val {
-           self.sram[3] |= 0b10;
+            self.status |= 0b10;
        }
        else {
-           self.sram[3] &= !0b10;
+        self.status &= !0b10;
        }
    }
+
 
     // Ticks 4 clock cycles
     pub fn tick(&mut self) {
@@ -184,46 +162,56 @@ impl CPU {
         if self.nop_next {
             self.nop_next = false;
             self.nop();
-            self.prev_op = Some(OpCode::NOP);
+            self.last_executed_op = Some(OpCode::NOP);
             self.pc += 1;
             return;
         }
 
-        // Handle 2 cycle instructions
+        // Handle second part of 2 cycle instruction
         if let Some(new_pc) = self.next_cycle_pc {
             self.next_cycle_pc = None;
-            self.prev_op = None;
+            self.last_executed_op = None;
             self.pc = new_pc;
             return;
         }
+
+        // update sram to reflect SFRs
+        // This is so instructions can read sram directly
+        // to access SFRs
+        self.sram[INDF] = self.indf;
+        self.sram[TMR0] = self.tmr0;
+        self.sram[PCL] = self.pcl;
+        self.sram[STATUS] = self.status;
+        self.sram[FSR] = self.fsr;
+        self.sram[OSCCAL] = self.osccal;
+        self.sram[GPIO] = self.gpio;
 
         // fetch instruction
         let instruction: u16 = self.flash[self.pc as usize];
 
         // decode
         let op_code: OpCode = CPU::decode_instruction(instruction);
+        
+        let pcl_before = self.pcl; // save pcl if it is changed by an instruction
 
-        let pcl_before =  (self.pc & 0xff) as u8;
-        self.sram[PCL] = pcl_before; // must reflect current instruction
-
+        // execute
         self.execute_op_code(op_code);
-        self.prev_op = Some(op_code);
+        // save last op-code for debugging
+        self.last_executed_op = Some(op_code);
+
 
         // check writes to PCL. Should update PC
-        let new_pcl = self.sram[PCL];
         if self.next_cycle_pc.is_some() {
             // Don't update PC. Next cycle should do that.
         }
-        else if new_pcl != pcl_before {
+        else if self.pcl != pcl_before {
             // wrote to pcl. should update pc
-            let mut new_pc = ((self.sram[STATUS] as u16 & 0b00100000) << 4) | new_pcl as u16;
-            new_pc &= !0b1_0000_0000u16; // bit 8 is cleared. can only set pc to 0-255
-            self.pc = new_pc;
+            // PIC12F508 only allows computed jumps to pc=0-255: bit8 is always cleared
+            self.pc = self.pcl as u16;
 
             // Any program branch flushes the currently fetched instruction
             // So even a movf -> pcl will take 2 cycles.
             self.nop_next = true; 
-
         }
         else {
             self.pc += 1; // increase PC as usual
@@ -231,8 +219,13 @@ impl CPU {
 
         // Wrap around if we index outside
         self.pc &= 0x1ff;
-
+        
+        // update sfr
+        self.pcl = (self.pc & 0xff) as u8;
+        
     }
+
+
 
     fn decode_instruction(instruction: u16) -> OpCode {
         let k8bit = (instruction & 0xff) as u8;
@@ -354,7 +347,7 @@ impl CPU {
         self.affect_dc(a & 0xf + b & 0xf > 15);
 
         if d {
-            self.sram[f as usize] = result as u8;
+            self.write(f, result as u8);
         }
         else {
             self.w = result as u8;
@@ -364,7 +357,7 @@ impl CPU {
     fn andwf(&mut self, f: u8, d: bool) {
         let result = self.w & self.sram[f as usize];
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result as u8);
         }
         else {
             self.w = result;
@@ -373,7 +366,7 @@ impl CPU {
     }
 
     fn clrf(&mut self, f: u8) {
-        self.sram[f as usize] = 0;
+        self.write(f, 0);
         self.affect_zero(true);
     }
 
@@ -385,7 +378,7 @@ impl CPU {
     fn comf(&mut self, f: u8, d: bool) {
         let result = !self.sram[f as usize];
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -396,7 +389,7 @@ impl CPU {
     fn decf(&mut self, f: u8, d: bool) {
         let result = self.sram[f as usize] - 1;
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -407,7 +400,7 @@ impl CPU {
     fn decfsz(&mut self, f: u8, d: bool) {
         let result = self.sram[f as usize] - 1;
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -421,7 +414,7 @@ impl CPU {
     fn incf(&mut self, f: u8, d: bool) {
         let result = self.sram[f as usize] + 1;
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -432,7 +425,7 @@ impl CPU {
     fn incfsz(&mut self, f: u8, d: bool) {
         let result = self.sram[f as usize] + 1;
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -446,7 +439,7 @@ impl CPU {
     fn iorwf(&mut self, f: u8, d: bool) {
         let result = self.w | self.sram[f as usize];
         if d {
-            self.sram[f as usize] = result
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -455,17 +448,18 @@ impl CPU {
     }
 
     fn movf(&mut self, f: u8, d: bool) {
+        let result = self.sram[f as usize];
         if d {
             // 
         }
         else {
-            self.w = self.w | self.sram[f as usize];
+            self.w = result;
         }
-        self.affect_zero(self.sram[f as usize] == 0);
+        self.affect_zero(result == 0);
     }
 
     fn movwf(&mut self, f: u8) {
-        self.sram[f as usize] = self.w;
+        self.write(f, self.w);
     }
 
     fn nop(&mut self) {
@@ -476,13 +470,13 @@ impl CPU {
         let mut result = self.sram[f as usize];
         let msb = result & 0x80 > 0;
         result <<= 1;
-        if self.status() & 0b1 > 0 {
+        if self.status_c() {
             // carry bit was set
             result |= 1;
         }
         self.affect_carry(msb);
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -493,13 +487,13 @@ impl CPU {
         let mut result = self.sram[f as usize];
         let lsb = result & 0x1 > 0;
         result >>= 1;
-        if self.status() & 0b1 > 0 {
+        if self.status_c() {
             // carry bit was set
             result |= 0x80;
         }
         self.affect_carry(lsb);
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -514,7 +508,7 @@ impl CPU {
         self.affect_zero(b == a);
         self.affect_dc(a & 0xf < b & 0xf); // not sure about this one
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -525,7 +519,7 @@ impl CPU {
         let value = self.sram[f as usize];
         let result = (value & 0xf) << 4 | (value >> 4);
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -536,7 +530,7 @@ impl CPU {
         let result = self.sram[f as usize] ^ self.w;
         self.affect_zero(result == 0);
         if d {
-            self.sram[f as usize] = result;
+            self.write(f, result);
         }
         else {
             self.w = result;
@@ -544,11 +538,13 @@ impl CPU {
     }
 
     fn bcf(&mut self, f: u8, b: u8) {
-        self.sram[f as usize] = self.sram[f as usize] & !(1 << b);
+        let result = self.sram[f as usize] & !(1 << b);
+        self.write(f, result);
     }
 
     fn bsf(&mut self, f: u8, b: u8) {
-        self.sram[f as usize] = self.sram[f as usize] | (1 << b);
+        let result = self.sram[f as usize] | (1 << b);
+        self.write(f, result);
     }
 
     fn btfsc(&mut self, f: u8, b: u8) {
@@ -573,7 +569,7 @@ impl CPU {
     fn call(&mut self, k: u8) {
         self.stack[1] = self.stack[0];
         self.stack[0] = self.pc + 1;
-        let new_pc = k as u16 | ((self.status() & 0b0110_0000) as u16) << 4;
+        let new_pc = k as u16 | ((self.status & 0b0110_0000) as u16) << 4;
         self.next_cycle_pc = Some(new_pc);
     }
 
@@ -621,6 +617,61 @@ impl CPU {
         self.w = self.w ^ k;
         self.affect_zero(self.w == 0);
     }
+
+    fn write(&mut self, f: u8, value: u8) {
+        if f < 7 {
+            match f as usize {
+                INDF => self.write_indf(value),
+                TMR0 => self.write_tmr0(value),
+                PCL => self.write_pcl(value),
+                STATUS => self.write_status(value),
+                FSR => self.write_fsr(value),
+                OSCCAL => self.write_osccal(value),
+                GPIO => self.write_gpio(value),
+                _ => panic!("Should not happen"),
+            }
+        }
+        else {
+            self.sram[f as usize] = value;
+        }
+    }
+
+    fn write_indf(&mut self, value: u8) {
+        let fsr = self.fsr;
+        if fsr as usize == INDF {
+            return; // cant write to INDF indirectly
+        }
+        self.write(fsr, value);
+    }
+
+    fn write_tmr0(&mut self, _value: u8) {
+        todo!()
+    }
+
+    fn write_pcl(&mut self, value: u8) {
+        self.pcl = value;
+        // Writing to PCL updates the program counter and
+        // results in a 2 cycle instruction
+    }
+
+    fn write_status(&mut self, value: u8) {
+        self.status = value & 0b11100111;
+    }
+
+    fn write_fsr(&mut self, value: u8) {
+        self.fsr = value & 0b11111; // 5 bit wide
+    }
+
+    fn write_osccal(&mut self, value: u8) {
+        self.osccal = value & !1; // bit0 unimplemented
+    }
+
+    fn write_gpio(&mut self, value: u8) {
+        // Writing to GPIO sets outputs
+        self.output_buffer = value & !self.trisgpio;
+    }
+
+
 
 
 }
