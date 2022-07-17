@@ -7,9 +7,9 @@ pub struct CPU {
     pub next_cycle_pc: Option<u16>, 
     pub nop_next: bool,
 
-    //pub last_executed_op: Option<OpCode>,
+    pub last_executed_op: Option<OpCode>,
 
-    pub fetched: Option<OpCode>,
+    //pub fetched: Option<OpCode>,
 
     pub cfg_word: u16,
     pub flash: [u16;512], // actually 12 bit words
