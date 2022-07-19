@@ -92,7 +92,7 @@ impl CPU {
         .encode(); // 0x0205; // MOVF OSCCAL, w
 
         // update sram
-        cpu.copy_regs_to_ram();
+        cpu.update_regs_and_ram();
 
         // Tick past the first instruction so the first tick after
         // creating a CPU will be the first instruction, ie reset vector
@@ -162,6 +162,8 @@ impl CPU {
 
     // Ticks 4 clock cycles
     pub fn tick(&mut self) {
+        self.update_regs_and_ram();
+
         // Some instructions "skip if.." execute
         // a NOP after a negative test
         // if self.nop_next {
@@ -189,18 +191,10 @@ impl CPU {
         self.next_op = Some(next_op_code);
 
         let pc_before = self.pc; // save pcl if it is changed by an instruction
-        let pcl_before = self.pcl;
         // execute
         self.execute_op_code(op_code);
         // save last op-code for debugging
         self.last_executed_op = Some(op_code);
-
-        // check writes to PCL. Should update PC
-        if pcl_before != self.pcl {
-            // PCL was written to during running
-            // update PC
-            self.pc = self.pcl as u16;
-        }
 
         // If PC was changed, throw away the next instruction
         if self.pc != pc_before {
@@ -215,16 +209,20 @@ impl CPU {
         // update sfrs
         self.pcl = (self.pc & 0xff) as u8;
 
-        self.gpio = ((self.input_buffer & self.trisgpio) | (self.output_buffer & !self.trisgpio))
-            & 0b11_1111; // 6 bits
-
-        self.copy_regs_to_ram();
+        self.update_regs_and_ram();
     }
 
-    fn copy_regs_to_ram(&mut self) {
+    fn update_regs_and_ram(&mut self) {
+
+        self.gpio = ((self.input_buffer & self.trisgpio) 
+        | (self.output_buffer & !self.trisgpio)) 
+        & 0b11_1111; // 6 bits
+
         // update sram to reflect SFRs
         // This is so instructions can read sram directly
         // to access SFRs
+        // We could also make a special "read()" function
+        // but this is easier.
         self.sram[INDF] = self.indf;
         self.sram[TMR0] = self.tmr0;
         self.sram[PCL] = self.pcl;
@@ -277,6 +275,7 @@ impl CPU {
         }
     }
 
+    // Writing to SFRs causes special things to happen
     fn write(&mut self, f: u8, value: u8) {
         if f < 7 {
             match f as usize {
@@ -307,9 +306,10 @@ impl CPU {
     }
 
     fn write_pcl(&mut self, value: u8) {
-        self.pcl = value;
-        // Writing to PCL updates the program counter and
-        // results in a 2 cycle instruction
+        // Writing to PCL updates the program counter
+        // Changing the PC flushes the next instruction
+        // making this a 2 cycle instruction
+        self.pc = value as u16;
     }
 
     fn write_status(&mut self, value: u8) {
@@ -545,7 +545,7 @@ impl CPU {
     }
 
     fn andlw(&mut self, k: u8) {
-        self.w = self.w & k;
+        self.w &= k;
         self.affect_zero(self.w == 0);
     }
 
@@ -557,6 +557,9 @@ impl CPU {
     }
 
     fn clrwdt(&mut self) {
+        // he CLRWDT instruction resets the WDT.
+        // It resets the prescaler, if it's assigned to the WDT
+        // Status bits TO and PD are set.
         todo!()
     }
 
@@ -565,7 +568,7 @@ impl CPU {
     }
 
     fn iorlw(&mut self, k: u8) {
-        self.w = self.w | k;
+        self.w |= k;
         self.affect_zero(self.w == 0);
     }
 
@@ -574,7 +577,8 @@ impl CPU {
     }
 
     fn option(&mut self) {
-        todo!()
+        self.option = self.w;
+        // TODO update stuff depending on OPTION reg bits
     }
 
     fn retlw(&mut self, k: u8) {
@@ -597,7 +601,7 @@ impl CPU {
     }
 
     fn xorlw(&mut self, k: u8) {
-        self.w = self.w ^ k;
+        self.w ^= k;
         self.affect_zero(self.w == 0);
     }
 
@@ -651,7 +655,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn addwf_stores_in_f() {
+        fn addwf() {
             let mut cpu = CPU::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
@@ -1092,9 +1096,12 @@ mod tests {
 
         #[test]
         fn clrwdt() {
+            // he CLRWDT instruction resets the WDT.
+            // It resets the prescaler, if it's assigned to the WDT
+            // Status bits TO and PD are set.
             let mut cpu = CPU::from_ops(vec![]);
             cpu.tick();
-            todo!();
+            // todo!();
         }
 
         #[test]
@@ -1138,45 +1145,88 @@ mod tests {
 
         #[test]
         fn movlw() {
-            let mut cpu = CPU::from_ops(vec![]);
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0xff },
+                OpCode::MOVLW { k: 0xaa },
+                OpCode::MOVLW { k: 0x00 },
+            ]);
             cpu.tick();
-            todo!();
+            assert_eq!(cpu.w, 0xff);
+            cpu.tick();
+            assert_eq!(cpu.w, 0xaa);
+            cpu.tick();
+            assert_eq!(cpu.w, 0x00);
+            assert!(!cpu.status_z()) // does not set flag
         }
 
         #[test]
         fn option() {
-            let mut cpu = CPU::from_ops(vec![]);
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0xaa },
+                OpCode::OPTION,
+            ]);
+            assert_eq!(cpu.option, 0xff);
             cpu.tick();
-            todo!();
+            cpu.tick();
+            assert_eq!(cpu.option, 0xaa);
         }
 
         #[test]
         fn retlw() {
-            let mut cpu = CPU::from_ops(vec![]);
-            cpu.tick();
-            todo!();
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::CALL { k: 4 },
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::RETLW { k: 0x55 },
+
+            ]);
+            cpu.run(2); // two ticks for CALL
+            cpu.run(2); // two ticks for RETLW
+            assert_eq!(cpu.pc, 1);
+            assert_eq!(cpu.w, 0x55);
         }
 
         #[test]
         fn sleep() {
-            let mut cpu = CPU::from_ops(vec![]);
-            cpu.tick();
-            todo!();
+            // let mut cpu = CPU::from_ops(vec![]);
+            // cpu.tick();
+            // todo!();
         }
 
         #[test]
         fn tris() {
-            let mut cpu = CPU::from_ops(vec![]);
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b010101 },
+                OpCode::TRIS { f: GPIO as u8 },
+            ]);
             cpu.tick();
-            todo!();
         }
 
         #[test]
         fn xorlw() {
-            let mut cpu = CPU::from_ops(vec![]);
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0x00 },
+                OpCode::XORLW { k: 0x00 },
+                OpCode::XORLW { k: 0xaa },
+                OpCode::XORLW { k: 0x55 },
+                OpCode::XORLW { k: 0x55 },
+                OpCode::XORLW { k: 0xaa },
+            ]);
             cpu.tick();
-            todo!();
+            cpu.tick();
+            assert_eq!(cpu.w, 0);
+            assert!(cpu.status_z());
+            cpu.tick();
+            assert_eq!(cpu.w, 0xaa);
+            cpu.tick();
+            assert_eq!(cpu.w, 0xff);
+            cpu.tick();
+            assert_eq!(cpu.w, 0xaa);
+            cpu.tick();
+            assert_eq!(cpu.w, 0x00);
+            assert!(cpu.status_z());
         }
-        
+
     }
 }
