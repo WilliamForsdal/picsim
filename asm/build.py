@@ -18,8 +18,8 @@ def main():
     # ./main.asm                which file to compile
 
  
-    for target in ["main"]:
-        file = f"./{target}.asm"
+    for target in ["all_instructions", "main"]:
+        file = f"./asm/{target}.asm"
         args = " ".join([
             "-mcpu=12F508",
             f"-o\"obj/{target}.hex\"",

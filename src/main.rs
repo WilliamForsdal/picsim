@@ -1,14 +1,24 @@
-mod cpu;
+
+#![feature(test)]
+
+pub mod cpu;
+pub mod opcode;
+
 use crate::cpu::CPU;
+use crate::opcode::OpCode;
 use std::fs;
 
 fn main() {
-    let contents = fs::read_to_string("obj/main.hex").unwrap();
-    let mut cpu: CPU = CPU::new(&contents);
-    println!("w:{}, pc:{:3}, z:{}, c:{}", cpu.w, cpu.pc, cpu.status_z(), cpu.status_c());
-    for i in 0..20 {
-        cpu.tick();
-        println!("{i:03} pc: {:03} W: 0x{:02X} executed: {:?} ", cpu.pc, cpu.w, cpu.last_executed_op);
+
+    for i in 0..u16::MAX {
+        let code = OpCode::decode(i);
+        println!("{code:?}");
     }
 
+    let contents = fs::read_to_string("obj/main.hex").unwrap();
+    let mut cpu: CPU = CPU::from_hex(&contents);
+    println!("w:{}, pc:{:3}, z:{}, c:{}", cpu.w, cpu.pc, cpu.status_z(), cpu.status_c());
+    for _ in 0..100000 {
+        cpu.tick();
+    }
 }
