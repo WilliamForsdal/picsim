@@ -59,16 +59,15 @@ impl CPU {
 
     fn new(flash: [u16; 512], cfg_word: u16) -> CPU {
         let mut cpu = CPU {
-            // nop_next: false,
-            last_executed_op: None,
-            next_op: None,
+            last_executed_op: None, // for debugging
+            next_op: None,          // next fetched instruction
 
-            cfg_word,
+            cfg_word,               
             flash,
             sram: [0; 32],
             stack: [0; 2],
 
-            w: 0, // will be overwritten with calibration value at reset
+            w: 0,                   // will be overwritten with calibration value at reset
             pc: 511,
             trisgpio: 0b11_1111,
             option: 0xff,
@@ -89,9 +88,9 @@ impl CPU {
             f: OSCCAL as u8,
             d: false,
         })
-        .encode(); // 0x0205; // MOVF OSCCAL, w
+        .encode(); // = 0x205;
 
-        // update sram
+        // update sram and sfrs
         cpu.update_regs_and_ram();
 
         // Tick past the first instruction so the first tick after
@@ -104,18 +103,18 @@ impl CPU {
         return cpu;
     }
 
-    pub fn set_input(&mut self, gpio: u8) {
-        if gpio > 5 {
+    pub fn set_input(&mut self, gpio_bit: u8) {
+        if gpio_bit > 5 {
             return;
         }
-        self.input_buffer |= 1 << gpio;
+        self.input_buffer |= 1 << gpio_bit;
     }
 
-    pub fn clr_input(&mut self, gpio: u8) {
-        if gpio > 5 {
+    pub fn clr_input(&mut self, gpio_bit: u8) {
+        if gpio_bit > 5 {
             return;
         }
-        self.input_buffer &= !(1 << gpio);
+        self.input_buffer &= !(1 << gpio_bit);
     }
 
     pub fn status_z(&self) -> bool {
@@ -154,6 +153,12 @@ impl CPU {
         self.flash[(pc & 0x1ff) as usize]
     }
 
+    fn fetch_next(&mut self) {
+        let instruction = self.fetch(self.pc + 1);
+        let op: OpCode = OpCode::decode(instruction);
+        self.next_op = Some(op);
+    }
+
     pub fn run(&mut self, ticks: u32) {
         for _ in 0..ticks {
             self.tick();
@@ -162,61 +167,45 @@ impl CPU {
 
     // Ticks 4 clock cycles
     pub fn tick(&mut self) {
-        self.update_regs_and_ram();
+        match self.next_op {
+            Some(op) => {
+                self.fetch_next();
+                let pc_before = self.pc; // save pcl if it is changed by an instruction
+                self.execute_op_code(op);
+                // save last op-code for debugging
+                self.last_executed_op = Some(op);
 
-        // Some instructions "skip if.." execute
-        // a NOP after a negative test
-        // if self.nop_next {
-        //     self.nop_next = false;
-        //     self.next_op = None;
-        //     self.pc += 1;
-        // }
+                // If PC was changed, throw away the next instruction
+                if self.pc != pc_before {
+                    self.next_op = None; // clear next instruction
+                } else {
+                    self.pc += 1; // increase PC as usual
+                }
 
-        // next_op is None first cycle after start,
-        // or after a branching instruction
-        if self.next_op.is_none() {
-            let current_pc_instruction: u16 = self.fetch(self.pc);
-            let next_op_code: OpCode = OpCode::decode(current_pc_instruction);
-            self.next_op = Some(next_op_code);
-            self.last_executed_op = None;
-            return;
-        }
+                // Wrap around if we index outside
+                self.pc &= 0x1ff;
 
-        let instruction = self.fetch(self.pc + 1);
+                self.pcl = (self.pc & 0xff) as u8;
 
-        // decode
-        let next_op_code: OpCode = OpCode::decode(instruction);
-
-        let op_code = self.next_op.unwrap();
-        self.next_op = Some(next_op_code);
-
-        let pc_before = self.pc; // save pcl if it is changed by an instruction
-        // execute
-        self.execute_op_code(op_code);
-        // save last op-code for debugging
-        self.last_executed_op = Some(op_code);
-
-        // If PC was changed, throw away the next instruction
-        if self.pc != pc_before {
-            self.next_op = None; // clear next instruction
-        } else {
-            self.pc += 1; // increase PC as usual
-        }
-
-        // Wrap around if we index outside
-        self.pc &= 0x1ff;
-
-        // update sfrs
-        self.pcl = (self.pc & 0xff) as u8;
-
-        self.update_regs_and_ram();
+                self.update_regs_and_ram();
+            }
+            None => {
+                // next_op is None first cycle after start,
+                // or after a branching instruction
+                // PC is not increased in this case
+                let current_pc_instruction: u16 = self.fetch(self.pc);
+                let next_op_code: OpCode = OpCode::decode(current_pc_instruction);
+                self.next_op = Some(next_op_code);
+                self.last_executed_op = None;
+            }
+        };
     }
 
     fn update_regs_and_ram(&mut self) {
-
-        self.gpio = ((self.input_buffer & self.trisgpio) 
-        | (self.output_buffer & !self.trisgpio)) 
-        & 0b11_1111; // 6 bits
+        // Cannot read INDF indirectly
+        if self.fsr == 0 {
+            self.indf = 0; 
+        }
 
         // update sram to reflect SFRs
         // This is so instructions can read sram directly
@@ -327,6 +316,8 @@ impl CPU {
     fn write_gpio(&mut self, value: u8) {
         // Writing to GPIO sets outputs
         self.output_buffer = value;
+        self.gpio = ((self.input_buffer & self.trisgpio) | (self.output_buffer & !self.trisgpio))
+            & 0b11_1111; // 6 bits
     }
 }
 
@@ -660,7 +651,7 @@ mod tests {
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x60 },
-                OpCode::ADDWF { f: 0x10, d: true }, // store in F
+                OpCode::ADDWF { f: 0x10, d: true },  // store in F
                 OpCode::ADDWF { f: 0x10, d: false }, // store in w
             ]);
             cpu.tick();
@@ -1004,10 +995,7 @@ mod tests {
 
         #[test]
         fn bcf() {
-            let mut ops = vec![
-                OpCode::MOVLW { k: 0xff },
-                OpCode::MOVWF { f: 0x10 },
-            ];
+            let mut ops = vec![OpCode::MOVLW { k: 0xff }, OpCode::MOVWF { f: 0x10 }];
             let mut ops2: Vec<OpCode> = (0..8).map(|i| OpCode::BCF { f: 0x10, b: i }).collect();
             ops.append(&mut ops2);
             let mut cpu = CPU::from_ops(ops);
@@ -1066,10 +1054,7 @@ mod tests {
 
         #[test]
         fn andlw() {
-            let mut cpu = CPU::from_ops(vec![
-                OpCode::MOVLW { k: 0xaa },
-                OpCode::ANDLW { k: 0x55 },
-            ]);
+            let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::ANDLW { k: 0x55 }]);
             cpu.run(2);
             assert_eq!(cpu.w, 0x00);
         }
@@ -1113,7 +1098,6 @@ mod tests {
                 OpCode::NOP,
                 OpCode::MOVLW { k: 0xff },
                 OpCode::GOTO { k: 500 },
-
             ]);
             cpu.tick();
             assert_eq!(cpu.pc, 4);
@@ -1161,10 +1145,7 @@ mod tests {
 
         #[test]
         fn option() {
-            let mut cpu = CPU::from_ops(vec![
-                OpCode::MOVLW { k: 0xaa },
-                OpCode::OPTION,
-            ]);
+            let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::OPTION]);
             assert_eq!(cpu.option, 0xff);
             cpu.tick();
             cpu.tick();
@@ -1179,7 +1160,6 @@ mod tests {
                 OpCode::NOP,
                 OpCode::NOP,
                 OpCode::RETLW { k: 0x55 },
-
             ]);
             cpu.run(2); // two ticks for CALL
             cpu.run(2); // two ticks for RETLW
@@ -1227,6 +1207,5 @@ mod tests {
             assert_eq!(cpu.w, 0x00);
             assert!(cpu.status_z());
         }
-
     }
 }
