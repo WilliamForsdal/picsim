@@ -18,7 +18,7 @@ def main():
     # ./main.asm                which file to compile
 
  
-    for target in ["all_instructions", "main"]:
+    for target in ["all_instructions", "main", "main2"]:
         file = f"./asm/{target}.asm"
         args = " ".join([
             "-mcpu=12F508",

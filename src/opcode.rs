@@ -211,7 +211,13 @@ mod tests {
     #[test]
     fn test_decode_all() {
         // This hex string contains all 33 instructions
-        let hex = fs::read_to_string("obj/all_instructions.hex").unwrap();
+        let hex = ":10000000FF0C3000F001500170007002F000F002AF
+:10001000B002F0033001310270033003B000B003CE
+:10002000B001F00550045006F007AA0E1E090400A6
+:10003000550D020003000600550F000A00080000DD
+:021FFE00EA0FE8
+:00000001FF
+";
         let (flash, cfg) = OpCode::from_hex(&hex);
         assert_eq!(cfg, 0b1111_1110_1010);
 
@@ -285,8 +291,14 @@ mod tests {
             OpCode::RETLW { k: 0 },
             OpCode::NOP,
         ];
-
-        let hex = fs::read_to_string("obj/all_instructions.hex").unwrap();
+        // This hex string contains all 33 instructions
+        let hex = ":10000000FF0C3000F001500170007002F000F002AF
+:10001000B002F0033001310270033003B000B003CE
+:10002000B001F00550045006F007AA0E1E090400A6
+:10003000550D020003000600550F000A00080000DD
+:021FFE00EA0FE8
+:00000001FF
+";
         let (flash, _) = OpCode::from_hex(&hex);
 
         for (i, code) in codes.iter().enumerate() {

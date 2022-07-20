@@ -5,6 +5,7 @@ pub struct CPU {
     //pub nop_next: bool,
     pub last_executed_op: Option<OpCode>,
     pub next_op: Option<OpCode>,
+    pc_written: bool,
 
     pub cfg_word: u16,
     pub flash: [u16; 512], // actually 12 bit words
@@ -14,7 +15,9 @@ pub struct CPU {
     pub stack: [u16; 2],
 
     pub w: u8,
-    pub pc: u16, // actually 12 bits? or 10?
+
+    // Remember to set pc_written when writing to PC
+    pub pc: u16, // actually 10 bits for real
     pub option: u8,
     pub trisgpio: u8, // not a memory mapped register
 
@@ -28,6 +31,57 @@ pub struct CPU {
     pub fsr: u8,
     pub osccal: u8,
     pub gpio: u8,
+
+    tmr0_state: TMR0,
+}
+
+// Store state for tmr0
+// When a write occurs to tmr0 reg, the increment
+// is inhibited for 2 cycles. Keep track of that here
+#[derive(Debug, Default)]
+struct TMR0 {
+    pub tmr0: u8,
+    tmr_prev: u8,
+    inc_inhibit: u8,
+    prescale_counter: u16,
+}
+
+impl TMR0 {
+    pub fn update(&mut self, option: u8) {
+        let enabled = (option & 0b100000) == 0;
+        if !enabled {
+            return;
+        }
+
+        // writes to TMR0 pause timer for 2 cycles
+        if self.tmr_prev != self.tmr0 {
+            self.tmr_prev = self.tmr0;
+            self.inc_inhibit = 2;
+            self.prescale_counter = 0; // prescaler counter is reset on write
+            return;
+        }
+        if self.inc_inhibit > 0 {
+            self.inc_inhibit -= 1;
+            return;
+        }
+
+        let prescale = option & 0b111;
+        let prescaler = 1 << (prescale + 1);
+        let prescale_enabled = (option & 0b1000) == 0;
+
+        if prescale_enabled {
+            self.prescale_counter += 1;
+            if self.prescale_counter >= prescaler {
+                self.prescale_counter = 0;
+                let (t, _overflow) = self.tmr0.overflowing_add(1);
+                self.tmr0 = t;
+            }
+        } else {
+            let (t, _overflow) = self.tmr0.overflowing_add(1);
+            self.tmr0 = t;
+        }
+        self.tmr_prev = self.tmr0;
+    }
 }
 
 const INDF: usize = 0;
@@ -37,6 +91,7 @@ const STATUS: usize = 3;
 const FSR: usize = 4;
 const OSCCAL: usize = 5;
 const GPIO: usize = 6;
+const OSC_CALIB_VAL: u8 = 0xb0;
 
 impl CPU {
     pub fn from_hex(program: &str) -> CPU {
@@ -61,13 +116,14 @@ impl CPU {
         let mut cpu = CPU {
             last_executed_op: None, // for debugging
             next_op: None,          // next fetched instruction
+            pc_written: false,
 
-            cfg_word,               
+            cfg_word,
             flash,
             sram: [0; 32],
             stack: [0; 2],
 
-            w: 0,                   // will be overwritten with calibration value at reset
+            w: 0, // will be overwritten with calibration value at reset
             pc: 511,
             trisgpio: 0b11_1111,
             option: 0xff,
@@ -82,13 +138,10 @@ impl CPU {
             fsr: 0b1110_0000,    // FSR    111x xxxx
             osccal: 0b1111_1111, // OSCCAL 111x xxxx
             gpio: 0b0000_0000,   // GPIO   111x xxxx
-        };
 
-        cpu.flash[511] = (OpCode::MOVF {
-            f: OSCCAL as u8,
-            d: false,
-        })
-        .encode(); // = 0x205;
+            tmr0_state: TMR0::default(),
+        };
+        cpu.flash[511] = (OpCode::MOVLW { k: OSC_CALIB_VAL }).encode(); // calibration value stored in W
 
         // update sram and sfrs
         cpu.update_regs_and_ram();
@@ -170,13 +223,15 @@ impl CPU {
         match self.next_op {
             Some(op) => {
                 self.fetch_next();
-                let pc_before = self.pc; // save pcl if it is changed by an instruction
+                let pc_prev = self.pc;
                 self.execute_op_code(op);
                 // save last op-code for debugging
                 self.last_executed_op = Some(op);
 
                 // If PC was changed, throw away the next instruction
-                if self.pc != pc_before {
+                if self.pc_written {
+                //if self.pc != pc_prev {
+                    self.pc_written = false;
                     self.next_op = None; // clear next instruction
                 } else {
                     self.pc += 1; // increase PC as usual
@@ -186,8 +241,6 @@ impl CPU {
                 self.pc &= 0x1ff;
 
                 self.pcl = (self.pc & 0xff) as u8;
-
-                self.update_regs_and_ram();
             }
             None => {
                 // next_op is None first cycle after start,
@@ -199,13 +252,19 @@ impl CPU {
                 self.last_executed_op = None;
             }
         };
+        self.update_regs_and_ram();
     }
 
     fn update_regs_and_ram(&mut self) {
         // Cannot read INDF indirectly
         if self.fsr == 0 {
-            self.indf = 0; 
+            self.indf = 0;
+        } else {
+            self.indf = self.sram[(self.fsr & 0b11111) as usize];
         }
+        self.tmr0_state.tmr0 = self.tmr0; // if it was written to this tick
+        self.tmr0_state.update(self.option);
+        self.tmr0 = self.tmr0_state.tmr0;
 
         // update sram to reflect SFRs
         // This is so instructions can read sram directly
@@ -290,8 +349,8 @@ impl CPU {
         self.write(fsr, value);
     }
 
-    fn write_tmr0(&mut self, _value: u8) {
-        todo!()
+    fn write_tmr0(&mut self, value: u8) {
+        self.tmr0 = value;
     }
 
     fn write_pcl(&mut self, value: u8) {
@@ -299,6 +358,7 @@ impl CPU {
         // Changing the PC flushes the next instruction
         // making this a 2 cycle instruction
         self.pc = value as u16;
+        self.pc_written = true;
     }
 
     fn write_status(&mut self, value: u8) {
@@ -315,7 +375,7 @@ impl CPU {
 
     fn write_gpio(&mut self, value: u8) {
         // Writing to GPIO sets outputs
-        self.output_buffer = value;
+        self.output_buffer = value & 0b11_1111; // only 6 bits
         self.gpio = ((self.input_buffer & self.trisgpio) | (self.output_buffer & !self.trisgpio))
             & 0b11_1111; // 6 bits
     }
@@ -543,8 +603,8 @@ impl CPU {
     fn call(&mut self, k: u8) {
         self.stack[1] = self.stack[0];
         self.stack[0] = self.pc + 1;
-        let new_pc = k as u16; // can only call first 256 indexes
-        self.pc = new_pc;
+        self.pc = k as u16; // can only call first 256 indexes
+        self.pc_written = true;
     }
 
     fn clrwdt(&mut self) {
@@ -556,6 +616,7 @@ impl CPU {
 
     fn goto(&mut self, k: u16) {
         self.pc = k;
+        self.pc_written = true;
     }
 
     fn iorlw(&mut self, k: u8) {
@@ -577,6 +638,7 @@ impl CPU {
         self.w = k;
         self.pc = self.stack[0];
         self.stack[0] = self.stack[1];
+        self.pc_written = true;
     }
 
     fn sleep(&mut self) {
@@ -605,8 +667,6 @@ impl CPU {
 mod tests {
     use super::*;
     extern crate test;
-    use crate::OpCode;
-    use crate::CPU;
     use std::fs;
     use test::Bencher;
 
@@ -616,7 +676,7 @@ mod tests {
         let mut cpu = CPU::from_ops(ops);
         assert_eq!(cpu.next_op.unwrap(), OpCode::MOVLW { k: 0xff });
         assert_eq!(cpu.pc, 0); // has executed first MOVF op at PC=0x1ff
-        assert_eq!(cpu.w, 0xff); // contains osccal at start
+        assert_eq!(cpu.w, OSC_CALIB_VAL); // contains osccal at start
         cpu.tick();
         assert_eq!(cpu.pc, 1);
         assert_eq!(cpu.next_op.unwrap(), OpCode::MOVWF { f: 0x10 });
@@ -632,6 +692,26 @@ mod tests {
         cpu.tick(); // jump
         assert_eq!(cpu.pc, 0x55);
         assert_eq!(cpu.next_op, None);
+        cpu.tick();
+        assert_eq!(cpu.pc, 0x55);
+    }
+
+    #[test]
+    fn jump_to_same_instruction_takes_2_cycles() {
+        // If jumping to the same location, PC will not change
+        // so we have to track every "write" to PC, regardless
+        // of the value written. This is done in any instruction
+        // that modifies the PC
+        let mut cpu = CPU::from_ops(vec![
+            OpCode::GOTO { k: 0 },
+        ]);
+        cpu.tick();
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.next_op, None);
+        cpu.tick();
+        assert_eq!(cpu.pc, 0);
+        cpu.tick(); // execute GOTO 0 again here
+        assert_eq!(cpu.pc, 0);
     }
 
     #[bench]
@@ -640,6 +720,235 @@ mod tests {
         let cpu: CPU = CPU::from_hex(&contents);
         let mut cpu = test::black_box(cpu);
         b.iter(|| cpu.tick());
+    }
+
+    mod tmr0_tests {
+        use super::*;
+
+        #[test]
+        fn clock_is_off_normally() {
+            let mut cpu = CPU::from_ops(vec![OpCode::GOTO { k: 0 }]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(100);
+            assert_eq!(cpu.tmr0, 0);
+        }
+
+        #[test]
+        fn clock_inc_one_per_cycle() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11011000 }, // start timer
+                OpCode::OPTION,
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2);
+            // after the OPTION instruction, the timer will start
+            // Since the timer increases after op execute, tmr0 will be 1 here
+            assert_eq!(cpu.tmr0, 1);
+            cpu.run(9);
+            assert_eq!(cpu.tmr0, 10);
+            cpu.run(245);
+            assert_eq!(cpu.tmr0, 255);
+            cpu.run(1);
+            assert_eq!(cpu.tmr0, 0); // wrap
+        }
+
+        #[test]
+        fn tmr_inhibit_2cycles_after_write() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11011000 }, // start timer
+                OpCode::OPTION,
+                OpCode::NOP,
+                OpCode::MOVLW { k: 100 },
+                OpCode::MOVWF { f: TMR0 as u8 }, // write
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                }, // read 100
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                }, // read 100
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                }, // read 100?
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                }, // read 101?
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2);
+            // after the OPTION instruction, the timer will start
+            // Since the timer increases after op execute, tmr0 will be 1 here
+            assert_eq!(cpu.tmr0, 1);
+            cpu.tick(); // nop
+            cpu.tick(); // movlw
+            assert_eq!(cpu.tmr0, 3);
+            cpu.tick(); // movwf tmr0
+            assert_eq!(cpu.tmr0, 100);
+            cpu.tick(); // movf
+            assert_eq!(cpu.w, 100);
+            assert_eq!(cpu.tmr0, 100);
+            cpu.tick();
+            assert_eq!(cpu.w, 100);
+            assert_eq!(cpu.tmr0, 100);
+            cpu.tick(); // tmr starts again this tick
+            assert_eq!(cpu.w, 100);
+            assert_eq!(cpu.tmr0, 101);
+            cpu.tick();
+            assert_eq!(cpu.w, 101);
+            assert_eq!(cpu.tmr0, 102);
+        }
+
+        #[test]
+        fn tmr_1to2_prescaler() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11010000 }, // start timer with 1:2 prescale
+                OpCode::OPTION,
+                OpCode::MOVLW { k: 100 },
+                OpCode::MOVWF { f: TMR0 as u8 },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2); // OPTION
+            assert_eq!(cpu.tmr0, 0);
+
+            cpu.run(2);  // MOVLW, MOVWF
+            assert_eq!(cpu.tmr0, 100);
+
+            cpu.tick();         // MOVF
+            assert_eq!(cpu.tmr0, 100);
+
+            cpu.tick();         // MOVF
+            assert_eq!(cpu.tmr0, 100);
+
+            cpu.tick();         // MOVF
+            assert_eq!(cpu.tmr0, 100);
+
+            cpu.tick();         // MOVF
+            assert_eq!(cpu.tmr0, 101);
+            assert_eq!(cpu.w, 100);
+
+            cpu.tick();
+            assert_eq!(cpu.tmr0, 101);
+            assert_eq!(cpu.w, 101);
+        }
+        
+        #[test]
+        fn tmr_1to4_prescaler() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11010001 }, // start timer with 1:4 prescale
+                OpCode::OPTION,
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::NOP,
+                OpCode::MOVLW { k: 100 },
+                OpCode::MOVWF { f: TMR0 as u8 },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2); // OPTION
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.tick();
+            assert_eq!(cpu.tmr0, 1);
+            cpu.run(4); // movlw 100, movwf tmr0
+            assert_eq!(cpu.tmr0, 100);
+            cpu.run(5);
+            assert_eq!(cpu.tmr0, 100);
+            cpu.tick();
+            assert_eq!(cpu.tmr0, 101);
+            assert_eq!(cpu.w, 100);
+        }
+        #[test]
+        fn tmr_1to256_prescaler() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11010111 }, // start timer with 1:4 prescale
+                OpCode::OPTION,
+                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::GOTO { k: 2 },
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(2); // OPTION
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(254);
+            assert_eq!(cpu.tmr0, 0);
+            cpu.run(1);
+            assert_eq!(cpu.tmr0, 1);
+            cpu.run(255);
+            assert_eq!(cpu.tmr0, 1);
+            cpu.run(1);
+            assert_eq!(cpu.tmr0, 2);
+        }
+
+    }
+
+    mod indirect_addressing {
+        use super::*;
+
+        #[test]
+        fn read_indf() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0x55 },
+                OpCode::MOVWF { f: 0x10 },
+                OpCode::MOVLW { k: 0x10 },
+                OpCode::MOVWF { f: FSR as u8 },
+                OpCode::CLRW,
+                OpCode::MOVF {
+                    f: INDF as u8,
+                    d: false,
+                },
+            ]);
+            cpu.run(6);
+            assert_eq!(cpu.w, 0x55);
+        }
+        #[test]
+        fn read_status_indf() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: STATUS as u8 },
+                OpCode::MOVWF { f: FSR as u8 },
+                OpCode::CLRW,
+                OpCode::MOVF {
+                    f: INDF as u8,
+                    d: false,
+                },
+            ]);
+            cpu.run(4);
+            assert_eq!(cpu.w, cpu.status);
+        }
+
+        #[test]
+        fn write_gpio_indf() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: GPIO as u8 },
+                OpCode::MOVWF { f: FSR as u8 },
+                OpCode::CLRW,
+                OpCode::TRIS { f: GPIO as u8 },
+                OpCode::MOVLW { k: 0b1111_1111 },
+                OpCode::MOVWF { f: INDF as u8 },
+                OpCode::CLRW,
+                OpCode::MOVF {
+                    f: INDF as u8,
+                    d: false,
+                },
+            ]);
+            cpu.run(8);
+            assert_eq!(cpu.gpio, 0b11_1111);
+            assert_eq!(cpu.w, 0b11_1111);
+        }
     }
 
     mod instructions {
