@@ -206,7 +206,6 @@ impl OpCode {
 #[cfg(test)]
 mod tests {
     use super::OpCode;
-    use std::fs;
 
     #[test]
     fn test_decode_all() {

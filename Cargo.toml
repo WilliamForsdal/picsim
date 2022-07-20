@@ -1,10 +1,8 @@
 [package]
-name = "pic12f508sim"
+name = "picsim"
 version = "0.1.0"
 edition = "2021"
-exclude = ["/obj", "/target"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+#exclude = ["/obj", "/target"]
 
 [dependencies]
 ihex = "3.0.0"

@@ -222,15 +222,15 @@ impl CPU {
     pub fn tick(&mut self) {
         match self.next_op {
             Some(op) => {
-                self.fetch_next();
-                let pc_prev = self.pc;
-                self.execute_op_code(op);
-                // save last op-code for debugging
+                self.fetch_next(); // updates next_op
+                self.execute_op_code(op); // runs current op
+
+                // save the executed op-code for debugging
                 self.last_executed_op = Some(op);
 
                 // If PC was changed, throw away the next instruction
                 if self.pc_written {
-                //if self.pc != pc_prev {
+                    //if self.pc != pc_prev {
                     self.pc_written = false;
                     self.next_op = None; // clear next instruction
                 } else {
@@ -241,6 +241,7 @@ impl CPU {
                 self.pc &= 0x1ff;
 
                 self.pcl = (self.pc & 0xff) as u8;
+                self.update_regs_and_ram();
             }
             None => {
                 // next_op is None first cycle after start,
@@ -250,11 +251,13 @@ impl CPU {
                 let next_op_code: OpCode = OpCode::decode(current_pc_instruction);
                 self.next_op = Some(next_op_code);
                 self.last_executed_op = None;
+                self.update_regs_and_ram();
             }
         };
-        self.update_regs_and_ram();
     }
 
+    // Updates registers and TMR0, and then updates
+    // sram to reflect the current registers.
     fn update_regs_and_ram(&mut self) {
         // Cannot read INDF indirectly
         if self.fsr == 0 {
@@ -281,8 +284,7 @@ impl CPU {
     }
 
     pub fn execute_op_code(&mut self, code: OpCode) {
-        // println!("executing {code:?}");
-        match code {
+        match code { // It's like rust enums were made for this
             OpCode::ADDWF { f, d } => self.addwf(f, d),
             OpCode::ANDWF { f, d } => self.andwf(f, d),
             OpCode::CLRF { f } => self.clrf(f),
@@ -308,6 +310,7 @@ impl CPU {
             OpCode::BTFSC { f, b } => self.btfsc(f, b),
             OpCode::BTFSS { f, b } => self.btfss(f, b),
 
+            // branching and literal operations
             OpCode::ANDLW { k } => self.andlw(k),
             OpCode::CALL { k } => self.call(k),
             OpCode::CLRWDT => self.clrwdt(),
@@ -702,9 +705,7 @@ mod tests {
         // so we have to track every "write" to PC, regardless
         // of the value written. This is done in any instruction
         // that modifies the PC
-        let mut cpu = CPU::from_ops(vec![
-            OpCode::GOTO { k: 0 },
-        ]);
+        let mut cpu = CPU::from_ops(vec![OpCode::GOTO { k: 0 }]);
         cpu.tick();
         assert_eq!(cpu.pc, 0);
         assert_eq!(cpu.next_op, None);
@@ -808,29 +809,44 @@ mod tests {
                 OpCode::OPTION,
                 OpCode::MOVLW { k: 100 },
                 OpCode::MOVWF { f: TMR0 as u8 },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
             ]);
             assert_eq!(cpu.tmr0, 0);
             cpu.run(2); // OPTION
             assert_eq!(cpu.tmr0, 0);
 
-            cpu.run(2);  // MOVLW, MOVWF
+            cpu.run(2); // MOVLW, MOVWF
             assert_eq!(cpu.tmr0, 100);
 
-            cpu.tick();         // MOVF
+            cpu.tick(); // MOVF
             assert_eq!(cpu.tmr0, 100);
 
-            cpu.tick();         // MOVF
+            cpu.tick(); // MOVF
             assert_eq!(cpu.tmr0, 100);
 
-            cpu.tick();         // MOVF
+            cpu.tick(); // MOVF
             assert_eq!(cpu.tmr0, 100);
 
-            cpu.tick();         // MOVF
+            cpu.tick(); // MOVF
             assert_eq!(cpu.tmr0, 101);
             assert_eq!(cpu.w, 100);
 
@@ -838,7 +854,7 @@ mod tests {
             assert_eq!(cpu.tmr0, 101);
             assert_eq!(cpu.w, 101);
         }
-        
+
         #[test]
         fn tmr_1to4_prescaler() {
             let mut cpu = CPU::from_ops(vec![
@@ -851,12 +867,30 @@ mod tests {
                 OpCode::NOP,
                 OpCode::MOVLW { k: 100 },
                 OpCode::MOVWF { f: TMR0 as u8 },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
-                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
             ]);
             assert_eq!(cpu.tmr0, 0);
             cpu.run(2); // OPTION
@@ -878,7 +912,10 @@ mod tests {
             let mut cpu = CPU::from_ops(vec![
                 OpCode::MOVLW { k: 0b11010111 }, // start timer with 1:4 prescale
                 OpCode::OPTION,
-                OpCode::MOVF { f: TMR0 as u8, d: false },
+                OpCode::MOVF {
+                    f: TMR0 as u8,
+                    d: false,
+                },
                 OpCode::GOTO { k: 2 },
             ]);
             assert_eq!(cpu.tmr0, 0);
@@ -893,7 +930,6 @@ mod tests {
             cpu.run(1);
             assert_eq!(cpu.tmr0, 2);
         }
-
     }
 
     mod indirect_addressing {
