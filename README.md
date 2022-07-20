@@ -7,3 +7,4 @@ can be encoded to 12-bit words, and decoded back to opcodes.
 
 ## TODO
 * WD timer with timeouts
+* SLEEP and wake from sleep
