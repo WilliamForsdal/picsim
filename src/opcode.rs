@@ -112,7 +112,7 @@ impl OpCode {
             0b101 => return OpCode::GOTO { k: k9bit },
             _ => (),
         };
-        panic!("Failed to decode instruction {instruction:03x}.");
+        panic!("Failed to decode instruction {instruction:03x}."); // I don't think this can happen
     }
 
     pub fn encode(self) -> u16 {
@@ -160,7 +160,6 @@ impl OpCode {
         // split into lines
         // find index of labels
         // parse instructions
-        // encode into hex
         todo!();
     }
 

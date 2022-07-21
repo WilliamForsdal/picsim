@@ -65,10 +65,9 @@ impl TMR0 {
             return;
         }
 
-        let prescale = option & 0b111;
-        let prescaler = 1 << (prescale + 1);
         let prescale_enabled = (option & 0b1000) == 0;
-
+        let prescaler = 1 << ((option & 0b111) + 1);
+        
         if prescale_enabled {
             self.prescale_counter += 1;
             if self.prescale_counter >= prescaler {
@@ -284,7 +283,8 @@ impl CPU {
     }
 
     pub fn execute_op_code(&mut self, code: OpCode) {
-        match code { // It's like rust enums were made for this
+        match code {
+            // It's like rust enums were made for this
             OpCode::ADDWF { f, d } => self.addwf(f, d),
             OpCode::ANDWF { f, d } => self.andwf(f, d),
             OpCode::CLRF { f } => self.clrf(f),
