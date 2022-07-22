@@ -1415,6 +1415,7 @@ mod tests {
                 OpCode::SWAPF { f: 0x10, d: true },
             ]);
             cpu.tick();
+            
             assert_eq!(cpu.pc, 3);
             assert_eq!(cpu.stack[0], 1);
             cpu.tick();
@@ -1431,7 +1432,6 @@ mod tests {
             // Status bits TO and PD are set.
             let mut cpu = CPU::from_ops(vec![]);
             cpu.tick();
-            // todo!();
         }
 
         #[test]
