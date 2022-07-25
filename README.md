@@ -24,6 +24,7 @@ associated functions.
 * `SLEEP` and wake from sleep
 * TMR0 in counter mode
 * config word settings
+* MCLR reset
 
 ## Fun TODOs
 * Small assembly compiler

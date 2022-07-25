@@ -1,17 +1,70 @@
+use core::panic;
+
 use crate::opcode::*;
 
+pub enum CfgFosc {
+    EXTRC,
+    INTRC,
+    XT,
+    LP,
+}
+
+pub struct ConfigWord {
+    mclre: bool,
+    cp_disable: bool,
+    wdte: bool,
+    fosc: CfgFosc,
+}
+
+impl ConfigWord {
+    pub fn default() -> ConfigWord {
+        ConfigWord {
+            mclre: false,
+            cp_disable: true,
+            wdte: false,
+            fosc: CfgFosc::INTRC,
+        }
+    }
+    pub fn from_value(value: u16) -> ConfigWord {
+        const MCLRE: u16 = 4;
+        const CP: u16 = 3;
+        const WDTE: u16 = 2;
+        const FOCS_MASK: u16 = 0b11;
+        ConfigWord {
+            mclre: (value >> MCLRE) & 1 > 0,
+            cp_disable: (value >> CP) & 1 > 0,
+            wdte: (value >> WDTE) & 1 > 0,
+            fosc: match value & FOCS_MASK {
+                0b00 => CfgFosc::LP,
+                0b01 => CfgFosc::XT,
+                0b10 => CfgFosc::INTRC,
+                0b11 => CfgFosc::EXTRC,
+                _ => panic!("can't happen"),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CpuState {
+    Normal,
+    Sleep,
+    Reset, // When MCLR is enabled, and MCLR pin is pulled low
+}
+
+pub const PIN_MCLR: u8 = 3;
+
 pub struct CPU {
+    pub ticks: u64,
     // Some instructions take 2 cycles and updates pc on the next cycle
     //pub nop_next: bool,
     pub last_executed_op: Option<OpCode>,
     pub next_op: Option<OpCode>,
     pc_written: bool,
 
-    pub cfg_word: u16,
+    pub cfg_word: ConfigWord,
     pub flash: [u16; 512], // actually 12 bit words
-
-    pub sram: [u8; 32], // lower 6 not used, SRFs
-
+    pub sram: [u8; 32],    // lower 6 not used, SRFs
     pub stack: [u16; 2],
 
     pub w: u8,
@@ -25,64 +78,30 @@ pub struct CPU {
     pub output_buffer: u8,
 
     pub indf: u8,
-    pub tmr0: u8,
     pub pcl: u8,
     pub status: u8,
     pub fsr: u8,
     pub osccal: u8,
     pub gpio: u8,
 
-    tmr0_state: TMR0,
-}
+    pub state: CpuState,
+    pub last_reset_reason: ResetReason,
 
-// Store state for tmr0
-// When a write occurs to tmr0 reg, the increment
-// is inhibited for 2 cycles. Keep track of that here
-#[derive(Debug, Default)]
-struct TMR0 {
     pub tmr0: u8,
-    tmr_prev: u8,
-    inc_inhibit: u8,
-    prescale_counter: u16,
+    tmr0_inhibit: u8,
+
+    // Actual register
+    // make it u16 so it fits 256 for TMR0
+    prescaler: u16,
+
+    // we need to count 18k instructions = 18ms.
+    // The WD oscillator is independent from the
+    // main oscillator, but simulating that would
+    // be more complicated. Just count to 18k here
+    wd_timer: u32,
 }
 
-impl TMR0 {
-    pub fn update(&mut self, option: u8) {
-        let enabled = (option & 0b100000) == 0;
-        if !enabled {
-            return;
-        }
-
-        // writes to TMR0 pause timer for 2 cycles
-        if self.tmr_prev != self.tmr0 {
-            self.tmr_prev = self.tmr0;
-            self.inc_inhibit = 2;
-            self.prescale_counter = 0; // prescaler counter is reset on write
-            return;
-        }
-        if self.inc_inhibit > 0 {
-            self.inc_inhibit -= 1;
-            return;
-        }
-
-        let prescale_enabled = (option & 0b1000) == 0;
-        let prescaler = 1 << ((option & 0b111) + 1);
-        
-        if prescale_enabled {
-            self.prescale_counter += 1;
-            if self.prescale_counter >= prescaler {
-                self.prescale_counter = 0;
-                let (t, _overflow) = self.tmr0.overflowing_add(1);
-                self.tmr0 = t;
-            }
-        } else {
-            let (t, _overflow) = self.tmr0.overflowing_add(1);
-            self.tmr0 = t;
-        }
-        self.tmr_prev = self.tmr0;
-    }
-}
-
+// SFR addresses
 const INDF: usize = 0;
 const TMR0: usize = 1;
 const PCL: usize = 2;
@@ -90,12 +109,32 @@ const STATUS: usize = 3;
 const FSR: usize = 4;
 const OSCCAL: usize = 5;
 const GPIO: usize = 6;
-const OSC_CALIB_VAL: u8 = 0xb0;
+const OSC_CALIB_VALUE: u8 = 0xb0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetReason {
+    POR,
+    MCLR,
+    MCLRSleep,
+    WDT,
+    WDTSleep,
+    PinChangeSleep,
+}
+
+enum StatusBit {
+    C,
+    DC,
+    Z,
+    PD,
+    TO,
+    PA0,
+    GPWUF,
+}
 
 impl CPU {
     pub fn from_hex(program: &str) -> CPU {
         let (flash, cfg_word) = OpCode::from_hex(program);
-        CPU::new(flash, cfg_word)
+        CPU::new_from_flash(flash, ConfigWord::default())
     }
 
     pub fn from_asm(asm: &str) -> CPU {
@@ -108,16 +147,29 @@ impl CPU {
         for (i, op) in ops.iter().enumerate() {
             flash[i] = op.to_owned().encode();
         }
-        CPU::new(flash, 4074)
+        CPU::new_from_flash(flash, ConfigWord::default())
     }
 
-    fn new(flash: [u16; 512], cfg_word: u16) -> CPU {
+    pub fn from_ops_and_cfg(ops: Vec<OpCode>, cfg: ConfigWord) -> CPU {
+        let mut flash: [u16; 512] = [0; 512];
+        for (i, op) in ops.iter().enumerate() {
+            flash[i] = op.to_owned().encode();
+        }
+        CPU::new_from_flash(flash, cfg)
+    }
+
+    pub fn new() -> CPU {
+        CPU::new_from_flash([0; 512], ConfigWord::default())
+    }
+
+    fn new_from_flash(flash: [u16; 512], cfg_word: ConfigWord) -> CPU {
         let mut cpu = CPU {
+            ticks: 0,
             last_executed_op: None, // for debugging
             next_op: None,          // next fetched instruction
             pc_written: false,
 
-            cfg_word,
+            cfg_word: cfg_word,
             flash,
             sram: [0; 32],
             stack: [0; 2],
@@ -135,22 +187,17 @@ impl CPU {
             pcl: 0b11111111,     // PC     1111 1111
             status: 0b0001_1000, // STATUS 1111 1xxx
             fsr: 0b1110_0000,    // FSR    111x xxxx
-            osccal: 0b1111_1111, // OSCCAL 111x xxxx
+            osccal: 0b1111_1110, // OSCCAL 1111 111x
             gpio: 0b0000_0000,   // GPIO   111x xxxx
 
-            tmr0_state: TMR0::default(),
+            prescaler: 0,
+            tmr0_inhibit: 0,
+            wd_timer: 0,
+            state: CpuState::Normal,
+            last_reset_reason: ResetReason::POR,
         };
-        cpu.flash[511] = (OpCode::MOVLW { k: OSC_CALIB_VAL }).encode(); // calibration value stored in W
-
-        // update sram and sfrs
-        cpu.update_regs_and_ram();
-
-        // Tick past the first instruction so the first tick after
-        // creating a CPU will be the first instruction, ie reset vector
-        while cpu.pc > 0 {
-            // PC rolls over after 2 cycles
-            cpu.tick();
-        }
+        cpu.flash[511] = (OpCode::MOVLW { k: OSC_CALIB_VALUE }).encode(); // calibration value stored in W
+        cpu.reset(ResetReason::POR);
 
         return cpu;
     }
@@ -159,46 +206,153 @@ impl CPU {
         if gpio_bit > 5 {
             return;
         }
+
+        let gpwu_mask = 0b11011;
+        let input_buffer_before = self.input_buffer;
+
+        let wake_inputs_before = self.trisgpio & self.input_buffer & gpwu_mask;
         self.input_buffer |= 1 << gpio_bit;
+        let wake_inputs_after = self.trisgpio & self.input_buffer & gpwu_mask;
+
+        if self.check_and_wake_on_pin_change(wake_inputs_before, wake_inputs_after) {
+            return;
+        } else if self.is_mclr_enabled() && gpio_bit == 3 && (input_buffer_before & 0b1000) == 0 {
+            match self.state {
+                CpuState::Normal => panic!("Shouldn't be in normal mode if GP3 was 0 and MCLRE"),
+                CpuState::Sleep => {
+                    self.reset(ResetReason::MCLRSleep);
+                }
+                CpuState::Reset => {
+                    self.reset(ResetReason::MCLR);
+                }
+            }
+        }
     }
 
     pub fn clr_input(&mut self, gpio_bit: u8) {
         if gpio_bit > 5 {
             return;
         }
+
+        let gpwu_mask = 0b11011;
+
+        let wake_inputs_before = self.trisgpio & self.input_buffer & gpwu_mask;
         self.input_buffer &= !(1 << gpio_bit);
-    }
+        let wake_inputs_after = self.trisgpio & self.input_buffer & gpwu_mask;
 
-    pub fn status_z(&self) -> bool {
-        (self.status & 0b100) > 0
-    }
+        if self.check_and_wake_on_pin_change(wake_inputs_before, wake_inputs_after) {
+            return;
+        }
 
-    pub fn status_c(&self) -> bool {
-        (self.status & 0b1) > 0
-    }
-
-    fn affect_zero(&mut self, val: bool) {
-        if val {
-            self.status |= 0b100;
-        } else {
-            self.status &= !0b100;
+        if gpio_bit == 3 && self.cfg_word.mclre {
+            self.state = CpuState::Reset;
         }
     }
 
-    fn affect_dc(&mut self, val: bool) {
-        if val {
-            self.status |= 0b10;
+    fn check_and_wake_on_pin_change(&mut self, inputs_before: u8, inputs_after: u8) -> bool {
+        if !self.sleeping() || !self.wake_on_pin_change_enabled() {
+            return false;
+        }
+        // if sleeping and pin change enabled, wake up
+        if inputs_before != inputs_after {
+            self.reset(ResetReason::PinChangeSleep);
+            true
         } else {
-            self.status &= !0b10;
+            false
+        }
+    }
+
+    // Status flags
+    pub fn status_c(&self) -> bool {
+        (self.status & (1 << 0)) > 0
+    }
+    pub fn status_dc(&self) -> bool {
+        (self.status & (1 << 1)) > 0
+    }
+    pub fn status_z(&self) -> bool {
+        (self.status & (1 << 2)) > 0
+    }
+    pub fn status_pd(&self) -> bool {
+        (self.status & (1 << 3)) > 0
+    }
+    pub fn status_to(&self) -> bool {
+        (self.status & (1 << 4)) > 0
+    }
+    pub fn status_pa0(&self) -> bool {
+        (self.status & (1 << 5)) > 0
+    }
+    pub fn status_gpwuf(&self) -> bool {
+        (self.status & (1 << 7)) > 0
+    }
+    pub fn is_wd_enabled(&self) -> bool {
+        self.cfg_word.wdte
+    }
+    pub fn is_mclr_enabled(&self) -> bool {
+        self.cfg_word.mclre
+    }
+    pub fn prescaler_assigned_to_wdt(&self) -> bool {
+        (self.option >> 3) & 1 > 0
+    }
+    pub fn prescaler_assigned_to_tmr0(&self) -> bool {
+        !self.prescaler_assigned_to_wdt()
+    }
+    pub fn wake_on_pin_change_enabled(&self) -> bool {
+        self.option & (1 << 7) == 0
+    }
+    pub fn sleeping(&self) -> bool {
+        self.state == CpuState::Sleep
+    }
+
+    pub fn in_normal_mode(&self) -> bool {
+        if let CpuState::Normal = self.state {
+            true
+        } else {
+            false
+        }
+    }
+    pub fn tmr0_enabled(&self) -> bool {
+        (self.option & 0b100000) == 0
+    }
+
+    fn affect_status_flag(&mut self, bit: StatusBit, val: bool) {
+        let bit_mask = 1
+            << match bit {
+                StatusBit::C => 0,
+                StatusBit::DC => 1,
+                StatusBit::Z => 2,
+                StatusBit::PD => 3,
+                StatusBit::TO => 4,
+                StatusBit::PA0 => 5,
+                StatusBit::GPWUF => 7,
+            };
+        if val {
+            self.status |= bit_mask;
+        } else {
+            self.status &= !bit_mask;
         }
     }
 
     fn affect_carry(&mut self, val: bool) {
-        if val {
-            self.status |= 0b1;
-        } else {
-            self.status &= !0b1;
-        }
+        self.affect_status_flag(StatusBit::C, val);
+    }
+
+    fn affect_dc(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::DC, val);
+    }
+    fn affect_zero(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::Z, val);
+    }
+    fn affect_pd(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::PD, val);
+    }
+    fn affect_to(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::TO, val);
+    }
+    fn affect_pa0(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::PA0, val);
+    }
+    fn affect_gpwuf(&mut self, val: bool) {
+        self.affect_status_flag(StatusBit::GPWUF, val);
     }
 
     fn fetch(&self, pc: u16) -> u16 {
@@ -219,6 +373,18 @@ impl CPU {
 
     // Ticks 4 clock cycles
     pub fn tick(&mut self) {
+        self.ticks += 1;
+
+        if let CpuState::Sleep = self.state {
+            // TODO wake on pin change
+            self.wd_tick(); // wd keeps running
+            return;
+        }
+
+        if let CpuState::Reset = self.state {
+            return;
+        }
+
         match self.next_op {
             Some(op) => {
                 self.fetch_next(); // updates next_op
@@ -243,7 +409,7 @@ impl CPU {
                 self.update_regs_and_ram();
             }
             None => {
-                // next_op is None first cycle after start,
+                // next_op is None first cycle after power on,
                 // or after a branching instruction
                 // PC is not increased in this case
                 let current_pc_instruction: u16 = self.fetch(self.pc);
@@ -258,15 +424,15 @@ impl CPU {
     // Updates registers and TMR0, and then updates
     // sram to reflect the current registers.
     fn update_regs_and_ram(&mut self) {
+        self.tmr0_tick();
+        self.wd_tick();
+
         // Cannot read INDF indirectly
         if self.fsr == 0 {
             self.indf = 0;
         } else {
             self.indf = self.sram[(self.fsr & 0b11111) as usize];
         }
-        self.tmr0_state.tmr0 = self.tmr0; // if it was written to this tick
-        self.tmr0_state.update(self.option);
-        self.tmr0 = self.tmr0_state.tmr0;
 
         // update sram to reflect SFRs
         // This is so instructions can read sram directly
@@ -280,6 +446,113 @@ impl CPU {
         self.sram[FSR] = self.fsr;
         self.sram[OSCCAL] = self.osccal;
         self.sram[GPIO] = self.gpio;
+    }
+
+    pub fn tmr0_tick(&mut self) {
+        if !self.tmr0_enabled() {
+            return;
+        }
+        // Update timer0 only if cpu is in normal operation mode
+        if !self.in_normal_mode() {
+            return; // TMR0 stopped.
+        }
+
+        if self.tmr0_inhibit > 0 {
+            if self.prescaler_assigned_to_tmr0() {
+                self.prescaler = 0;
+            }
+            self.tmr0_inhibit -= 1;
+            return;
+        }
+
+        // u16 to not overflow
+        let prescaler: u16 = 1 << ((self.option & 0b111) + 1);
+
+        if self.prescaler_assigned_to_tmr0() {
+            self.prescaler += 1;
+            if self.prescaler >= prescaler {
+                self.prescaler = 0;
+                let (t, _overflow) = self.tmr0.overflowing_add(1);
+                self.tmr0 = t;
+            }
+        } else {
+            let (t, _overflow) = self.tmr0.overflowing_add(1);
+            self.tmr0 = t;
+        }
+    }
+
+    fn wd_tick(&mut self) {
+        if !self.is_wd_enabled() {
+            return;
+        }
+        self.wd_timer += 1;
+        let wd_wrap = 18000; // 18 ms nominal
+
+        if self.wd_timer > wd_wrap {
+            self.wd_timer = 0;
+            if self.prescaler_assigned_to_wdt() {
+                self.prescaler += 1;
+                let wd_postscaler_wrap = 1 << (self.option & 0b111);
+                if self.prescaler >= wd_postscaler_wrap {
+                    // Watchdog timeout
+                    if let CpuState::Sleep = self.state {
+                        self.reset(ResetReason::WDTSleep);
+                    } else {
+                        self.reset(ResetReason::WDT);
+                    }
+                }
+            } else {
+                // Watchdog timeout
+                if let CpuState::Sleep = self.state {
+                    self.reset(ResetReason::WDTSleep);
+                } else {
+                    self.reset(ResetReason::WDT);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self, reason: ResetReason) {
+        println!("Reset occurred. Reason: {reason:?} at ticks={}", self.ticks);
+        self.state = CpuState::Normal;
+        self.last_reset_reason = reason;
+        self.next_op = None;
+        // W gets loaded with oscillator calibration value by first instruction
+        // indf unchanged
+        // TMR0 unchanged
+        self.pc = 511;
+
+        let status = self.status;
+        // Only status is affected by reason
+        self.status = match reason {
+            ResetReason::POR => 0b0001_1000,
+            ResetReason::MCLR => status & 0b0001_1111,
+            ResetReason::MCLRSleep => 0b0001_0000 | (status & 0b111),
+            ResetReason::WDT => (status & 0b1111),
+            ResetReason::WDTSleep => (status & 0b111),
+            ResetReason::PinChangeSleep => 0b1001_0000 | (status & 0b111),
+        };
+
+        self.fsr = match reason {
+            ResetReason::POR => 0b1110_0000,
+            _ => self.fsr | 0b1110_0000,
+        };
+        self.osccal = match reason {
+            ResetReason::POR => 0b1111_1110,
+            _ => self.osccal,
+        };
+        self.option = 0xff;
+        self.trisgpio = 0b0011_1111;
+
+        // update sram and sfrs
+        self.update_regs_and_ram();
+
+        // Tick past the first instruction so the first tick after
+        // creating a CPU will be the first instruction, ie reset vector
+        while self.pc > 0 {
+            // PC rolls over after 2 cycles
+            self.tick();
+        }
     }
 
     pub fn execute_op_code(&mut self, code: OpCode) {
@@ -354,6 +627,7 @@ impl CPU {
 
     fn write_tmr0(&mut self, value: u8) {
         self.tmr0 = value;
+        self.tmr0_inhibit = 3; // inhibit timer for 2 cycles + this cycle!
     }
 
     fn write_pcl(&mut self, value: u8) {
@@ -614,7 +888,12 @@ impl CPU {
         // he CLRWDT instruction resets the WDT.
         // It resets the prescaler, if it's assigned to the WDT
         // Status bits TO and PD are set.
-        todo!()
+        self.affect_pd(true);
+        self.affect_to(true);
+        self.wd_timer = 0;
+        if self.prescaler_assigned_to_wdt() {
+            self.prescaler = 0;
+        }
     }
 
     fn goto(&mut self, k: u16) {
@@ -645,7 +924,17 @@ impl CPU {
     }
 
     fn sleep(&mut self) {
-        todo!()
+        /*  00h → WDT;
+        0 → WDT prescaler;
+        1 → TO;
+        0 → PD */
+        self.wd_timer = 0;
+        self.affect_to(true); // set TO
+        self.affect_pd(false);
+        if self.prescaler_assigned_to_wdt() {
+            self.prescaler = 0;
+        }
+        self.state = CpuState::Sleep;
     }
 
     fn tris(&mut self, f: u8) {
@@ -670,7 +959,6 @@ impl CPU {
 mod tests {
     use super::*;
     extern crate test;
-    use std::fs;
     use test::Bencher;
 
     #[test]
@@ -679,7 +967,7 @@ mod tests {
         let mut cpu = CPU::from_ops(ops);
         assert_eq!(cpu.next_op.unwrap(), OpCode::MOVLW { k: 0xff });
         assert_eq!(cpu.pc, 0); // has executed first MOVF op at PC=0x1ff
-        assert_eq!(cpu.w, OSC_CALIB_VAL); // contains osccal at start
+        assert_eq!(cpu.w, OSC_CALIB_VALUE); // contains osccal at start
         cpu.tick();
         assert_eq!(cpu.pc, 1);
         assert_eq!(cpu.next_op.unwrap(), OpCode::MOVWF { f: 0x10 });
@@ -703,7 +991,7 @@ mod tests {
     fn jump_to_same_instruction_takes_2_cycles() {
         // If jumping to the same location, PC will not change
         // so we have to track every "write" to PC, regardless
-        // of the value written. This is done in any instruction
+        // of the value written. This is done manually in any instruction
         // that modifies the PC
         let mut cpu = CPU::from_ops(vec![OpCode::GOTO { k: 0 }]);
         cpu.tick();
@@ -717,7 +1005,13 @@ mod tests {
 
     #[bench]
     fn bench_run_cpu(b: &mut Bencher) {
-        let contents = fs::read_to_string("obj/main.hex").unwrap();
+        const HEX: &str = ":10000000010AD70C02003E0C0600010C2100080A70
+:10001000010243060C0A0E0A0605100A0604100A1D
+:02002000080ACC
+:021FFE00EA0FE8
+:00000001FF
+";
+        let contents = HEX;
         let cpu: CPU = CPU::from_hex(&contents);
         let mut cpu = test::black_box(cpu);
         b.iter(|| cpu.tick());
@@ -732,6 +1026,16 @@ mod tests {
             assert_eq!(cpu.tmr0, 0);
             cpu.run(100);
             assert_eq!(cpu.tmr0, 0);
+        }
+
+        #[test]
+        fn write_tmr0_when_disabled() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 100 },
+                OpCode::MOVWF { f: TMR0 as u8 },
+            ]);
+            cpu.run(2);
+            assert_eq!(cpu.tmr0, 100);
         }
 
         #[test]
@@ -907,6 +1211,7 @@ mod tests {
             assert_eq!(cpu.tmr0, 101);
             assert_eq!(cpu.w, 100);
         }
+
         #[test]
         fn tmr_1to256_prescaler() {
             let mut cpu = CPU::from_ops(vec![
@@ -984,6 +1289,190 @@ mod tests {
             cpu.run(8);
             assert_eq!(cpu.gpio, 0b11_1111);
             assert_eq!(cpu.w, 0b11_1111);
+        }
+    }
+
+    mod states {
+        use super::*;
+
+        #[test]
+        fn mclr_holds_in_reset() {
+            let cfg = ConfigWord {
+                mclre: true,
+                cp_disable: true,
+                wdte: false,
+                fosc: CfgFosc::INTRC,
+            };
+            let mut cpu = CPU::from_ops_and_cfg(
+                vec![
+                    OpCode::MOVLW { k: 0b1100_1000 },
+                    OpCode::OPTION,
+                    OpCode::GOTO { k: 2 },
+                ],
+                cfg,
+            );
+            assert!(cpu.is_mclr_enabled());
+            cpu.run(100);
+            cpu.clr_input(3);
+            assert_eq!(cpu.state, CpuState::Reset);
+            for _ in 0..1_000_000 {
+                cpu.tick();
+                assert_eq!(cpu.pc, 2);
+            }
+            cpu.set_input(3);
+            assert_eq!(cpu.state, CpuState::Normal);
+            assert!(!cpu.status_gpwuf()); // 0
+            assert!(cpu.status_to()); // u
+            assert!(cpu.status_pd()); // u
+        }
+
+        #[test]
+        fn sleep_wake_by_mclr() {
+            let cfg = ConfigWord {
+                mclre: true,
+                cp_disable: true,
+                wdte: false,
+                fosc: CfgFosc::INTRC,
+            };
+            let mut cpu = CPU::from_ops_and_cfg(vec![OpCode::NOP, OpCode::SLEEP], cfg);
+            assert!(cpu.is_mclr_enabled());
+            cpu.run(2);
+            assert_eq!(cpu.state, CpuState::Sleep);
+            cpu.clr_input(3);
+            assert_eq!(cpu.state, CpuState::Reset);
+            for _ in 0..1_000 {
+                cpu.tick();
+                assert_eq!(cpu.pc, 2);
+            }
+            cpu.set_input(3);
+            assert_eq!(cpu.state, CpuState::Normal);
+            assert!(!cpu.status_gpwuf()); // 0
+            assert!(cpu.status_to()); //1
+            assert!(!cpu.status_pd()); // 0
+        }
+
+        #[test]
+        fn sleep_wake_by_wdt() {
+            // todo!("WDT timeout during sleep should wake cpu and set correct bits.");
+            let cfg = ConfigWord {
+                mclre: false,
+                cp_disable: true,
+                wdte: true,
+                fosc: CfgFosc::INTRC,
+            };
+            let mut cpu = CPU::from_ops_and_cfg(
+                vec![
+                    OpCode::MOVLW { k: 0b1100_1000 },
+                    OpCode::OPTION,
+                    OpCode::SLEEP,
+                ],
+                cfg,
+            );
+            cpu.run(3);
+            while cpu.pc > 0 {
+                cpu.tick();
+            }
+            assert!(!cpu.status_to());
+            assert!(!cpu.status_pd());
+        }
+
+        #[test]
+        fn sleep_wdt_disabled_does_not_wake() {
+            let cfg = ConfigWord {
+                mclre: false,
+                cp_disable: true,
+                wdte: false,
+                fosc: CfgFosc::INTRC,
+            };
+            let mut cpu = CPU::from_ops_and_cfg(
+                vec![
+                    OpCode::MOVLW { k: 0b1100_1000 },
+                    OpCode::OPTION,
+                    OpCode::SLEEP,
+                ],
+                cfg,
+            );
+            cpu.run(1_000_000);
+            assert!(cpu.status_to());
+            assert!(!cpu.status_pd());
+            assert_eq!(cpu.state, CpuState::Sleep);
+        }
+
+        #[test]
+        fn por_registers_are_correct() {
+            let mut cpu = CPU::new();
+            cpu.reset(ResetReason::POR);
+            assert_eq!(cpu.w, OSC_CALIB_VALUE);
+            // indf is undefined
+            // tmr0 is undefined?
+            assert_eq!(cpu.pc, 0); // 1111_1111 at por but executes one op to wrap to 0.
+
+            assert_eq!(cpu.status & 0b1111_100, 0b0001_1000); // 0001 1xxx
+            assert_eq!(cpu.fsr & 0b1110_0000, 0b1110_0000); // 111x xxxx
+            assert_eq!(cpu.osccal, 0b1111_1110);
+            assert_eq!(cpu.option, 0xff);
+            assert_eq!(cpu.trisgpio, 0x3f);
+        }
+
+        #[test]
+        fn mclr_status_correct() {
+            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            cpu.run(1);
+            let bits_before = cpu.status & 0b0001_1111;
+            cpu.reset(ResetReason::MCLR);
+            assert_eq!(cpu.status, bits_before);
+        }
+
+        #[test]
+        fn mclr_sleep_status_correct() {
+            let mut cpu = CPU::from_ops(vec![OpCode::CLRW, OpCode::SLEEP]); // sets Z-flag
+            cpu.run(2);
+            let bits_before = cpu.status & 0b0001_1111;
+            cpu.reset(ResetReason::MCLRSleep);
+            assert_eq!(cpu.status, bits_before);
+        }
+
+        #[test]
+        fn wdt_status_correct() {
+            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            cpu.run(1);
+            let bits_before = cpu.status & 0b0000_1111;
+            cpu.reset(ResetReason::WDT);
+            assert_eq!(cpu.status, bits_before);
+            assert!(!cpu.status_to()); // TO flag is inverted. 0 -> timeout
+        }
+
+        #[test]
+        fn wdt_sleep_status_correct() {
+            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            cpu.run(1);
+            let bits_before = cpu.status & 0b0000_0111;
+            cpu.reset(ResetReason::WDTSleep);
+            assert_eq!(cpu.status, bits_before);
+            assert!(!cpu.status_to()); // TO flag is inverted. 0 -> timeout
+            assert!(!cpu.status_pd()); // TO flag is inverted. 0 -> timeout
+        }
+
+        #[test]
+        fn pin_change_wake_sleep_status_correct() {
+            let cfg = ConfigWord {
+                mclre: true,
+                cp_disable: true,
+                wdte: false,
+                fosc: CfgFosc::INTRC,
+            };
+            let mut cpu = CPU::from_ops_and_cfg(
+                vec![OpCode::MOVLW { k: 0 }, OpCode::OPTION, OpCode::SLEEP],
+                cfg,
+            );
+            cpu.run(3);
+            assert_eq!(cpu.state, CpuState::Sleep);
+            cpu.set_input(4);
+            assert_eq!(cpu.state, CpuState::Normal);
+            assert_eq!(cpu.last_reset_reason, ResetReason::PinChangeSleep);
+            assert!(cpu.status_gpwuf()); // 1
+            assert!(cpu.status_to());    // 1
+            assert!(!cpu.status_pd());   // 0
         }
     }
 
@@ -1415,7 +1904,7 @@ mod tests {
                 OpCode::SWAPF { f: 0x10, d: true },
             ]);
             cpu.tick();
-            
+
             assert_eq!(cpu.pc, 3);
             assert_eq!(cpu.stack[0], 1);
             cpu.tick();
@@ -1430,8 +1919,21 @@ mod tests {
             // he CLRWDT instruction resets the WDT.
             // It resets the prescaler, if it's assigned to the WDT
             // Status bits TO and PD are set.
-            let mut cpu = CPU::from_ops(vec![]);
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11001000 },
+                OpCode::OPTION,
+                OpCode::CLRWDT,
+            ]);
+            cpu.run(2);
+            cpu.status &= 0b11100111; // manually clear these bits
+            cpu.prescaler = 0xaa;
+            assert!(cpu.prescaler_assigned_to_wdt());
+            assert!(!cpu.status_pd());
+            assert!(!cpu.status_to());
             cpu.tick();
+            assert!(cpu.status_pd());
+            assert!(cpu.status_to());
+            assert_eq!(cpu.prescaler, 0);
         }
 
         #[test]
@@ -1514,9 +2016,40 @@ mod tests {
 
         #[test]
         fn sleep() {
-            // let mut cpu = CPU::from_ops(vec![]);
-            // cpu.tick();
-            // todo!();
+            /* 00h → WDT;
+            0 → WDT prescaler;
+            1 → TO;
+            0 → PD */
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11001111 }, // assign prescaler to WDT
+                OpCode::OPTION,
+                OpCode::SLEEP,
+            ]);
+            cpu.run(2);
+            cpu.prescaler = 0xaa;
+            cpu.tick();
+            assert_eq!(cpu.wd_timer, 0);
+            assert!(cpu.status_to());
+            assert!(!cpu.status_pd());
+            assert_eq!(cpu.prescaler, 0);
+            assert_eq!(cpu.state, CpuState::Sleep);
+
+            /* 00h → WDT;
+            0 → WDT prescaler;
+            1 → TO;
+            0 → PD */
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b11100111 }, // assign prescaler to tmr0
+                OpCode::OPTION,
+                OpCode::SLEEP,
+            ]);
+            cpu.run(2);
+            cpu.prescaler = 0xaa;
+            cpu.tick();
+            assert_eq!(cpu.wd_timer, 0);
+            assert!(cpu.status_to());
+            assert!(!cpu.status_pd());
+            assert_eq!(cpu.prescaler, 0xaa); // not affected
         }
 
         #[test]
