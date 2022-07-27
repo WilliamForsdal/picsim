@@ -1,4 +1,5 @@
 use core::panic;
+use std::pin;
 
 use crate::opcode::*;
 
@@ -10,13 +11,20 @@ pub enum CfgFosc {
 }
 
 pub struct ConfigWord {
-    mclre: bool,
-    cp_disable: bool,
-    wdte: bool,
-    fosc: CfgFosc,
+    pub mclre: bool,
+    pub cp_disable: bool,
+    pub wdte: bool,
+    pub fosc: CfgFosc,
 }
 
 impl ConfigWord {
+    pub fn is_wd_enabled(&self) -> bool {
+        self.wdte
+    }
+    pub fn is_mclr_enabled(&self) -> bool {
+        self.mclre
+    }
+
     pub fn default() -> ConfigWord {
         ConfigWord {
             mclre: false,
@@ -49,20 +57,73 @@ impl ConfigWord {
 pub enum CpuState {
     Normal,
     Sleep,
-    Reset, // When MCLR is enabled, and MCLR pin is pulled low
+    MclrLow, // When MCLR is enabled, and MCLR pin is pulled low
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    Floating,
+    Low,
+    High,
+}
+
+pub fn bit_is_set(bits: u8, bit: u8) -> bool {
+    (bits & (1 << bit)) > 0
+}
+
+pub fn bit_is_clear(bits: u8, bit: u8) -> bool {
+    (bits & (1 << bit)) == 0
+}
+
+pub struct OptionReg {
+    pub bits: u8,
+}
+const GPWU: u8 = 7;
+const GPPU: u8 = 6;
+const T0CS: u8 = 5;
+// const T0SE: u8 = 4;
+const PSA: u8 = 3;
+// const PS2: u8 = 2;
+// const PS1: u8 = 1;
+// const PS0: u8 = 0;
+
+impl OptionReg {
+    pub fn wake_on_pin_change_enabled(&self) -> bool {
+        bit_is_clear(self.bits, GPWU)
+    }
+    pub fn weak_pull_ups_enabled(&self) -> bool {
+        bit_is_clear(self.bits, GPPU)
+    }
+    pub fn tmr0_enabled(&self) -> bool {
+        bit_is_clear(self.bits, T0CS)
+    }
+    pub fn prescaler_assigned_to_wdt(&self) -> bool {
+        bit_is_set(self.bits, PSA)
+    }
+    pub fn prescaler_assigned_to_tmr0(&self) -> bool {
+        bit_is_clear(self.bits, PSA)
+    }
+    pub fn prescaler_rate_wdt(&self) -> u16 {
+        1 << (self.bits & 7)
+    }
+    pub fn prescaler_rate_tmr0(&self) -> u16 {
+        1 << ((self.bits & 7) + 1)
+    }
 }
 
 pub const PIN_MCLR: u8 = 3;
 
 pub struct CPU {
     pub ticks: u64,
-    // Some instructions take 2 cycles and updates pc on the next cycle
-    //pub nop_next: bool,
     pub last_executed_op: Option<OpCode>,
+
+    // the decoded next op
+    // None at first tick, or after branch
     pub next_op: Option<OpCode>,
+
     pc_written: bool,
 
-    pub cfg_word: ConfigWord,
+    pub config: ConfigWord,
     pub flash: [u16; 512], // actually 12 bit words
     pub sram: [u8; 32],    // lower 6 not used, SRFs
     pub stack: [u16; 2],
@@ -71,10 +132,10 @@ pub struct CPU {
 
     // Remember to set pc_written when writing to PC
     pub pc: u16, // actually 10 bits for real
-    pub option: u8,
+    pub option: OptionReg,
     pub trisgpio: u8, // not a memory mapped register
 
-    pub input_buffer: u8, // store input data
+    pub input_buffer: [Input; 6], // store input data
     pub output_buffer: u8,
 
     pub indf: u8,
@@ -169,7 +230,7 @@ impl CPU {
             next_op: None,          // next fetched instruction
             pc_written: false,
 
-            cfg_word: cfg_word,
+            config: cfg_word,
             flash,
             sram: [0; 32],
             stack: [0; 2],
@@ -177,9 +238,9 @@ impl CPU {
             w: 0, // will be overwritten with calibration value at reset
             pc: 511,
             trisgpio: 0b11_1111,
-            option: 0xff,
+            option: OptionReg { bits: 0xff },
 
-            input_buffer: 0,
+            input_buffer: [Input::Floating; 6],
             output_buffer: 0,
 
             indf: 0,             // INDF   xxxx xxxx
@@ -188,7 +249,7 @@ impl CPU {
             status: 0b0001_1000, // STATUS 1111 1xxx
             fsr: 0b1110_0000,    // FSR    111x xxxx
             osccal: 0b1111_1110, // OSCCAL 1111 111x
-            gpio: 0b0000_0000,   // GPIO   111x xxxx
+            gpio: 0b00_0000,     // GPIO   111x xxxx
 
             prescaler: 0,
             tmr0_inhibit: 0,
@@ -202,63 +263,39 @@ impl CPU {
         return cpu;
     }
 
-    pub fn set_input(&mut self, gpio_bit: u8) {
+    pub fn set_pin(&mut self, gpio_bit: u8, state: Input) {
         if gpio_bit > 5 {
             return;
         }
+        let pin_mask = 1 << gpio_bit;
+        let inputs_before = self.gpio & self.trisgpio;
+        self.input_buffer[gpio_bit as usize] = state;
+        self.set_gpio_inputs();
+        let inputs_after = self.gpio & self.trisgpio;
 
-        let gpwu_mask = 0b11011;
-        let input_buffer_before = self.input_buffer;
-
-        let wake_inputs_before = self.trisgpio & self.input_buffer & gpwu_mask;
-        self.input_buffer |= 1 << gpio_bit;
-        let wake_inputs_after = self.trisgpio & self.input_buffer & gpwu_mask;
-
-        if self.check_and_wake_on_pin_change(wake_inputs_before, wake_inputs_after) {
-            return;
-        } else if self.is_mclr_enabled() && gpio_bit == 3 && (input_buffer_before & 0b1000) == 0 {
-            match self.state {
-                CpuState::Normal => panic!("Shouldn't be in normal mode if GP3 was 0 and MCLRE"),
-                CpuState::Sleep => {
-                    self.reset(ResetReason::MCLRSleep);
+        // Handle MCLRE
+        if self.config.is_mclr_enabled() && gpio_bit == 3 {
+            if inputs_after & pin_mask == 0 {
+                match self.state {
+                    CpuState::Sleep => self.reset(ResetReason::MCLRSleep),
+                    CpuState::Normal => self.reset(ResetReason::MCLR),
+                    CpuState::MclrLow => (),
                 }
-                CpuState::Reset => {
-                    self.reset(ResetReason::MCLR);
-                }
+                // wait for mclr to turn on
+                self.state = CpuState::MclrLow;
+            } else if inputs_before & pin_mask == 0 && inputs_after & pin_mask > 0 {
+                self.state = CpuState::Normal;
             }
         }
-    }
 
-    pub fn clr_input(&mut self, gpio_bit: u8) {
-        if gpio_bit > 5 {
+        // Handle Wake on pin change
+        if !self.option.wake_on_pin_change_enabled() || !self.sleeping() {
             return;
         }
-
-        let gpwu_mask = 0b11011;
-
-        let wake_inputs_before = self.trisgpio & self.input_buffer & gpwu_mask;
-        self.input_buffer &= !(1 << gpio_bit);
-        let wake_inputs_after = self.trisgpio & self.input_buffer & gpwu_mask;
-
-        if self.check_and_wake_on_pin_change(wake_inputs_before, wake_inputs_after) {
-            return;
-        }
-
-        if gpio_bit == 3 && self.cfg_word.mclre {
-            self.state = CpuState::Reset;
-        }
-    }
-
-    fn check_and_wake_on_pin_change(&mut self, inputs_before: u8, inputs_after: u8) -> bool {
-        if !self.sleeping() || !self.wake_on_pin_change_enabled() {
-            return false;
-        }
-        // if sleeping and pin change enabled, wake up
-        if inputs_before != inputs_after {
+        let wake_on_change_mask = 0b1011 & pin_mask;
+        println!("{inputs_before:08b}, {inputs_after:08b}, {wake_on_change_mask:08b}");
+        if inputs_before & wake_on_change_mask != inputs_after & wake_on_change_mask {
             self.reset(ResetReason::PinChangeSleep);
-            true
-        } else {
-            false
         }
     }
 
@@ -284,21 +321,7 @@ impl CPU {
     pub fn status_gpwuf(&self) -> bool {
         (self.status & (1 << 7)) > 0
     }
-    pub fn is_wd_enabled(&self) -> bool {
-        self.cfg_word.wdte
-    }
-    pub fn is_mclr_enabled(&self) -> bool {
-        self.cfg_word.mclre
-    }
-    pub fn prescaler_assigned_to_wdt(&self) -> bool {
-        (self.option >> 3) & 1 > 0
-    }
-    pub fn prescaler_assigned_to_tmr0(&self) -> bool {
-        !self.prescaler_assigned_to_wdt()
-    }
-    pub fn wake_on_pin_change_enabled(&self) -> bool {
-        self.option & (1 << 7) == 0
-    }
+
     pub fn sleeping(&self) -> bool {
         self.state == CpuState::Sleep
     }
@@ -309,9 +332,6 @@ impl CPU {
         } else {
             false
         }
-    }
-    pub fn tmr0_enabled(&self) -> bool {
-        (self.option & 0b100000) == 0
     }
 
     fn affect_status_flag(&mut self, bit: StatusBit, val: bool) {
@@ -381,7 +401,7 @@ impl CPU {
             return;
         }
 
-        if let CpuState::Reset = self.state {
+        if let CpuState::MclrLow = self.state {
             return;
         }
 
@@ -406,6 +426,8 @@ impl CPU {
                 self.pc &= 0x1ff;
 
                 self.pcl = (self.pc & 0xff) as u8;
+                self.tmr0_tick();
+                self.wd_tick();
                 self.update_regs_and_ram();
             }
             None => {
@@ -416,6 +438,8 @@ impl CPU {
                 let next_op_code: OpCode = OpCode::decode(current_pc_instruction);
                 self.next_op = Some(next_op_code);
                 self.last_executed_op = None;
+                self.tmr0_tick();
+                self.wd_tick();
                 self.update_regs_and_ram();
             }
         };
@@ -424,8 +448,17 @@ impl CPU {
     // Updates registers and TMR0, and then updates
     // sram to reflect the current registers.
     fn update_regs_and_ram(&mut self) {
-        self.tmr0_tick();
-        self.wd_tick();
+        // update sram to reflect SFRs
+        // This is so instructions can read sram directly
+        // to access SFRs
+        // We could also make a special "read()" function
+        // but this is easier.
+        self.sram[TMR0] = self.tmr0;
+        self.sram[PCL] = self.pcl;
+        self.sram[STATUS] = self.status;
+        self.sram[FSR] = self.fsr;
+        self.sram[OSCCAL] = self.osccal;
+        self.sram[GPIO] = self.gpio;
 
         // Cannot read INDF indirectly
         if self.fsr == 0 {
@@ -433,23 +466,11 @@ impl CPU {
         } else {
             self.indf = self.sram[(self.fsr & 0b11111) as usize];
         }
-
-        // update sram to reflect SFRs
-        // This is so instructions can read sram directly
-        // to access SFRs
-        // We could also make a special "read()" function
-        // but this is easier.
-        self.sram[INDF] = self.indf;
-        self.sram[TMR0] = self.tmr0;
-        self.sram[PCL] = self.pcl;
-        self.sram[STATUS] = self.status;
-        self.sram[FSR] = self.fsr;
-        self.sram[OSCCAL] = self.osccal;
-        self.sram[GPIO] = self.gpio;
+        self.sram[INDF] = self.indf; // update indf last
     }
 
     pub fn tmr0_tick(&mut self) {
-        if !self.tmr0_enabled() {
+        if !self.option.tmr0_enabled() {
             return;
         }
         // Update timer0 only if cpu is in normal operation mode
@@ -458,7 +479,7 @@ impl CPU {
         }
 
         if self.tmr0_inhibit > 0 {
-            if self.prescaler_assigned_to_tmr0() {
+            if self.option.prescaler_assigned_to_tmr0() {
                 self.prescaler = 0;
             }
             self.tmr0_inhibit -= 1;
@@ -466,11 +487,10 @@ impl CPU {
         }
 
         // u16 to not overflow
-        let prescaler: u16 = 1 << ((self.option & 0b111) + 1);
 
-        if self.prescaler_assigned_to_tmr0() {
+        if self.option.prescaler_assigned_to_tmr0() {
             self.prescaler += 1;
-            if self.prescaler >= prescaler {
+            if self.prescaler >= self.option.prescaler_rate_tmr0() {
                 self.prescaler = 0;
                 let (t, _overflow) = self.tmr0.overflowing_add(1);
                 self.tmr0 = t;
@@ -482,7 +502,7 @@ impl CPU {
     }
 
     fn wd_tick(&mut self) {
-        if !self.is_wd_enabled() {
+        if !self.config.is_wd_enabled() {
             return;
         }
         self.wd_timer += 1;
@@ -490,10 +510,9 @@ impl CPU {
 
         if self.wd_timer > wd_wrap {
             self.wd_timer = 0;
-            if self.prescaler_assigned_to_wdt() {
+            if self.option.prescaler_assigned_to_wdt() {
                 self.prescaler += 1;
-                let wd_postscaler_wrap = 1 << (self.option & 0b111);
-                if self.prescaler >= wd_postscaler_wrap {
+                if self.prescaler >= self.option.prescaler_rate_wdt() {
                     // Watchdog timeout
                     if let CpuState::Sleep = self.state {
                         self.reset(ResetReason::WDTSleep);
@@ -533,16 +552,16 @@ impl CPU {
             ResetReason::PinChangeSleep => 0b1001_0000 | (status & 0b111),
         };
 
-        self.fsr = match reason {
-            ResetReason::POR => 0b1110_0000,
-            _ => self.fsr | 0b1110_0000,
-        };
-        self.osccal = match reason {
-            ResetReason::POR => 0b1111_1110,
-            _ => self.osccal,
-        };
-        self.option = 0xff;
+        if reason == ResetReason::POR {
+            self.fsr = 0b1110_0000;
+            self.osccal = 0b1111_1110;
+        } else {
+            self.fsr |= 0b1110_0000;
+        }
+
+        self.option.bits = 0xff;
         self.trisgpio = 0b0011_1111;
+        self.set_gpio_inputs();
 
         // update sram and sfrs
         self.update_regs_and_ram();
@@ -552,6 +571,29 @@ impl CPU {
         while self.pc > 0 {
             // PC rolls over after 2 cycles
             self.tick();
+        }
+    }
+
+    fn set_gpio_inputs(&mut self) {
+        for input in 0..6 {
+            let mask = 1 << input;
+            if (self.trisgpio & mask) != 0 || (input == PIN_MCLR && self.config.is_mclr_enabled()) {
+                match self.input_buffer[input as usize] {
+                    Input::Floating => {
+                        if self.is_pin_pulled_up(input) {
+                            self.gpio |= mask;
+                        } else {
+                            self.gpio &= !mask;
+                        }
+                    }
+                    Input::Low => {
+                        self.gpio &= !mask;
+                    }
+                    Input::High => {
+                        self.gpio |= mask;
+                    }
+                }
+            }
         }
     }
 
@@ -652,9 +694,19 @@ impl CPU {
 
     fn write_gpio(&mut self, value: u8) {
         // Writing to GPIO sets outputs
-        self.output_buffer = value & 0b11_1111; // only 6 bits
-        self.gpio = ((self.input_buffer & self.trisgpio) | (self.output_buffer & !self.trisgpio))
-            & 0b11_1111; // 6 bits
+        // Output buffer is saved regardless of trisgpio
+        self.output_buffer = value & 0b11_0111; // only 6 bits, GP3 is input only
+        let outputs = self.output_buffer & !self.trisgpio;
+        self.gpio = (self.gpio & self.trisgpio) | outputs;
+    }
+
+    fn is_pin_pulled_up(&self, gpio_bit: u8) -> bool {
+        match gpio_bit {
+            0 => self.option.weak_pull_ups_enabled(),
+            1 => self.option.weak_pull_ups_enabled(),
+            3 => self.option.weak_pull_ups_enabled() || self.config.is_mclr_enabled(),
+            _ => false,
+        }
     }
 }
 
@@ -891,7 +943,7 @@ impl CPU {
         self.affect_pd(true);
         self.affect_to(true);
         self.wd_timer = 0;
-        if self.prescaler_assigned_to_wdt() {
+        if self.option.prescaler_assigned_to_wdt() {
             self.prescaler = 0;
         }
     }
@@ -911,8 +963,9 @@ impl CPU {
     }
 
     fn option(&mut self) {
-        self.option = self.w;
-        // TODO update stuff depending on OPTION reg bits
+        self.option.bits = self.w;
+        // GPIO depends on option, refresh the pins here.
+        self.set_gpio_inputs();
     }
 
     fn retlw(&mut self, k: u8) {
@@ -931,7 +984,7 @@ impl CPU {
         self.wd_timer = 0;
         self.affect_to(true); // set TO
         self.affect_pd(false);
-        if self.prescaler_assigned_to_wdt() {
+        if self.option.prescaler_assigned_to_wdt() {
             self.prescaler = 0;
         }
         self.state = CpuState::Sleep;
@@ -1017,7 +1070,93 @@ mod tests {
         b.iter(|| cpu.tick());
     }
 
-    mod tmr0_tests {
+    mod gpio {
+        use super::*;
+
+        #[test]
+        fn weak_pull_ups_set_input() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b00111111 },
+                OpCode::OPTION,
+                OpCode::MOVLW { k: 0b01111111 },
+                OpCode::OPTION,
+            ]);
+            assert_eq!(cpu.gpio, 0x0);
+            cpu.run(2);
+            assert_eq!(cpu.gpio, 0x0b);
+            cpu.run(2);
+            assert_eq!(cpu.gpio, 0x0);
+        }
+
+        #[test]
+        fn weak_pull_ups_set_low_is_low() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::MOVLW { k: 0b00111111 },
+                OpCode::OPTION,
+            ]);
+            assert_eq!(cpu.gpio, 0x0);
+            cpu.run(2);
+            assert_eq!(cpu.gpio, 0x0b);
+            cpu.set_pin(0, Input::Low);
+            assert_eq!(cpu.gpio, 0x0a);
+            cpu.set_pin(1, Input::Low);
+            assert_eq!(cpu.gpio, 0x08);
+            cpu.set_pin(3, Input::Low);
+            assert_eq!(cpu.gpio, 0);
+            cpu.set_pin(0, Input::Floating);
+            cpu.set_pin(1, Input::Floating);
+            cpu.set_pin(3, Input::Floating);
+            assert_eq!(cpu.gpio, 0x0b);
+        }
+
+        #[test]
+        fn write_gpio_sets_outputs() {
+            let mut cpu = CPU::from_ops(vec![
+                OpCode::CLRW,
+                OpCode::TRIS { f: GPIO as u8 },
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 0,
+                },
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 1,
+                },
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 2,
+                },
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 3,
+                }, // 3 is input only. nothing happens
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 4,
+                },
+                OpCode::BSF {
+                    f: GPIO as u8,
+                    b: 5,
+                },
+            ]);
+            cpu.run(2);
+            assert_eq!(cpu.gpio, 0x00);
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x01);
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x03);
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x07);
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x07); // 3 is input only. nothing happens
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x17);
+            cpu.tick();
+            assert_eq!(cpu.gpio, 0x37);
+        }
+    }
+
+    mod tmr0 {
         use super::*;
 
         #[test]
@@ -1267,8 +1406,10 @@ mod tests {
                     d: false,
                 },
             ]);
-            cpu.run(4);
-            assert_eq!(cpu.w, cpu.status);
+            cpu.run(3);
+            let status = cpu.status;
+            cpu.tick();
+            assert_eq!(cpu.w, status);
         }
 
         #[test]
@@ -1287,8 +1428,8 @@ mod tests {
                 },
             ]);
             cpu.run(8);
-            assert_eq!(cpu.gpio, 0b11_1111);
-            assert_eq!(cpu.w, 0b11_1111);
+            assert_eq!(cpu.gpio, 0b11_0111);
+            assert_eq!(cpu.w, 0b11_0111);
         }
     }
 
@@ -1307,23 +1448,30 @@ mod tests {
                 vec![
                     OpCode::MOVLW { k: 0b1100_1000 },
                     OpCode::OPTION,
+                    OpCode::MOVLW { k: 0 },
+                    OpCode::TRIS { f: GPIO as u8 },
                     OpCode::GOTO { k: 2 },
                 ],
                 cfg,
             );
-            assert!(cpu.is_mclr_enabled());
+
+            assert!(cpu.config.is_mclr_enabled());
             cpu.run(100);
-            cpu.clr_input(3);
-            assert_eq!(cpu.state, CpuState::Reset);
-            for _ in 0..1_000_000 {
-                cpu.tick();
-                assert_eq!(cpu.pc, 2);
-            }
-            cpu.set_input(3);
-            assert_eq!(cpu.state, CpuState::Normal);
+            cpu.set_pin(3, Input::Low);
+
+            // Actual reset happens on pin low transition
+            assert_eq!(cpu.state, CpuState::MclrLow);
             assert!(!cpu.status_gpwuf()); // 0
             assert!(cpu.status_to()); // u
             assert!(cpu.status_pd()); // u
+            assert_eq!(cpu.trisgpio, 0b11_1111);
+
+            for _ in 0..1_000_000 {
+                cpu.tick();
+                assert_eq!(cpu.pc, 0); // waiting to run because mclr still low
+            }
+            cpu.set_pin(3, Input::High);
+            assert_eq!(cpu.state, CpuState::Normal);
         }
 
         #[test]
@@ -1335,16 +1483,17 @@ mod tests {
                 fosc: CfgFosc::INTRC,
             };
             let mut cpu = CPU::from_ops_and_cfg(vec![OpCode::NOP, OpCode::SLEEP], cfg);
-            assert!(cpu.is_mclr_enabled());
+            assert!(cpu.config.is_mclr_enabled());
             cpu.run(2);
             assert_eq!(cpu.state, CpuState::Sleep);
-            cpu.clr_input(3);
-            assert_eq!(cpu.state, CpuState::Reset);
+            cpu.set_pin(3, Input::Low);
+            assert_eq!(cpu.state, CpuState::MclrLow);
             for _ in 0..1_000 {
                 cpu.tick();
-                assert_eq!(cpu.pc, 2);
+                assert_eq!(cpu.pc, 0);
             }
-            cpu.set_input(3);
+            cpu.set_pin(3, Input::Floating);
+            assert!(cpu.gpio & 0b1000 > 0); // Weakly pulled up
             assert_eq!(cpu.state, CpuState::Normal);
             assert!(!cpu.status_gpwuf()); // 0
             assert!(cpu.status_to()); //1
@@ -1410,7 +1559,7 @@ mod tests {
             assert_eq!(cpu.status & 0b1111_100, 0b0001_1000); // 0001 1xxx
             assert_eq!(cpu.fsr & 0b1110_0000, 0b1110_0000); // 111x xxxx
             assert_eq!(cpu.osccal, 0b1111_1110);
-            assert_eq!(cpu.option, 0xff);
+            assert_eq!(cpu.option.bits, 0xff);
             assert_eq!(cpu.trisgpio, 0x3f);
         }
 
@@ -1467,12 +1616,15 @@ mod tests {
             );
             cpu.run(3);
             assert_eq!(cpu.state, CpuState::Sleep);
-            cpu.set_input(4);
-            assert_eq!(cpu.state, CpuState::Normal);
+            cpu.set_pin(4, Input::High);
+            assert_eq!(cpu.state, CpuState::Sleep); // GP4 does not wake
+            cpu.set_pin(1, Input::High);
+            assert_eq!(cpu.state, CpuState::Sleep); // GP1 is pulled high
+            cpu.set_pin(1, Input::Low);
             assert_eq!(cpu.last_reset_reason, ResetReason::PinChangeSleep);
             assert!(cpu.status_gpwuf()); // 1
-            assert!(cpu.status_to());    // 1
-            assert!(!cpu.status_pd());   // 0
+            assert!(cpu.status_to()); // 1
+            assert!(!cpu.status_pd()); // 0
         }
     }
 
@@ -1927,7 +2079,7 @@ mod tests {
             cpu.run(2);
             cpu.status &= 0b11100111; // manually clear these bits
             cpu.prescaler = 0xaa;
-            assert!(cpu.prescaler_assigned_to_wdt());
+            assert!(cpu.option.prescaler_assigned_to_wdt());
             assert!(!cpu.status_pd());
             assert!(!cpu.status_to());
             cpu.tick();
@@ -1993,10 +2145,10 @@ mod tests {
         #[test]
         fn option() {
             let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::OPTION]);
-            assert_eq!(cpu.option, 0xff);
+            assert_eq!(cpu.option.bits, 0xff);
             cpu.tick();
             cpu.tick();
-            assert_eq!(cpu.option, 0xaa);
+            assert_eq!(cpu.option.bits, 0xaa);
         }
 
         #[test]
