@@ -1,8 +1,8 @@
 use core::panic;
-use std::pin;
 
 use crate::opcode::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CfgFosc {
     EXTRC,
     INTRC,
@@ -113,7 +113,7 @@ impl OptionReg {
 
 pub const PIN_MCLR: u8 = 3;
 
-pub struct CPU {
+pub struct Pic12F508 {
     pub ticks: u64,
     pub last_executed_op: Option<OpCode>,
 
@@ -192,39 +192,42 @@ enum StatusBit {
     GPWUF,
 }
 
-impl CPU {
-    pub fn from_hex(program: &str) -> CPU {
+impl Pic12F508 {
+    pub fn from_hex(program: &str) -> Pic12F508 {
         let (flash, cfg_word) = OpCode::from_hex(program);
-        CPU::new_from_flash(flash, ConfigWord::default())
+        Pic12F508::new_from_flash(flash, ConfigWord::default())
     }
 
-    pub fn from_asm(asm: &str) -> CPU {
+    pub fn from_asm(asm: &str) -> Pic12F508 {
         let ops = OpCode::compile(asm);
-        CPU::from_ops(ops)
+        Pic12F508::from_ops(ops)
     }
 
-    pub fn from_ops(ops: Vec<OpCode>) -> CPU {
+    pub fn from_ops(ops: Vec<OpCode>) -> Pic12F508 {
         let mut flash: [u16; 512] = [0; 512];
         for (i, op) in ops.iter().enumerate() {
             flash[i] = op.to_owned().encode();
         }
-        CPU::new_from_flash(flash, ConfigWord::default())
+        Pic12F508::new_from_flash(flash, ConfigWord::default())
     }
 
-    pub fn from_ops_and_cfg(ops: Vec<OpCode>, cfg: ConfigWord) -> CPU {
+    pub fn from_ops_and_cfg(ops: Vec<OpCode>, cfg: ConfigWord) -> Pic12F508 {
         let mut flash: [u16; 512] = [0; 512];
         for (i, op) in ops.iter().enumerate() {
             flash[i] = op.to_owned().encode();
         }
-        CPU::new_from_flash(flash, cfg)
+        Pic12F508::new_from_flash(flash, cfg)
     }
 
-    pub fn new() -> CPU {
-        CPU::new_from_flash([0; 512], ConfigWord::default())
+    pub fn new() -> Pic12F508 {
+        Pic12F508::new_from_flash([0; 512], ConfigWord::default())
     }
 
-    fn new_from_flash(flash: [u16; 512], cfg_word: ConfigWord) -> CPU {
-        let mut cpu = CPU {
+    fn new_from_flash(flash: [u16; 512], cfg_word: ConfigWord) -> Pic12F508 {
+        if cfg_word.fosc != CfgFosc::INTRC {
+            panic!("Only INTRC implemented.");
+        }
+        let mut cpu = Pic12F508 {
             ticks: 0,
             last_executed_op: None, // for debugging
             next_op: None,          // next fetched instruction
@@ -514,6 +517,7 @@ impl CPU {
                 self.prescaler += 1;
                 if self.prescaler >= self.option.prescaler_rate_wdt() {
                     // Watchdog timeout
+                    self.prescaler = 0;
                     if let CpuState::Sleep = self.state {
                         self.reset(ResetReason::WDTSleep);
                     } else {
@@ -555,7 +559,10 @@ impl CPU {
         if reason == ResetReason::POR {
             self.fsr = 0b1110_0000;
             self.osccal = 0b1111_1110;
-        } else {
+            self.tmr0 = 0;
+            self.prescaler = 0;
+        } 
+        else {
             self.fsr |= 0b1110_0000;
         }
 
@@ -711,7 +718,7 @@ impl CPU {
 }
 
 // Instructions
-impl CPU {
+impl Pic12F508 {
     fn addwf(&mut self, f: u8, d: bool) {
         let a = self.sram[f as usize];
         let b = self.w;
@@ -1017,7 +1024,7 @@ mod tests {
     #[test]
     fn test_run_cpu() {
         let ops = vec![OpCode::MOVLW { k: 0xff }, OpCode::MOVWF { f: 0x10 }];
-        let mut cpu = CPU::from_ops(ops);
+        let mut cpu = Pic12F508::from_ops(ops);
         assert_eq!(cpu.next_op.unwrap(), OpCode::MOVLW { k: 0xff });
         assert_eq!(cpu.pc, 0); // has executed first MOVF op at PC=0x1ff
         assert_eq!(cpu.w, OSC_CALIB_VALUE); // contains osccal at start
@@ -1028,7 +1035,7 @@ mod tests {
 
     #[test]
     fn calculated_jump_sets_pc() {
-        let mut cpu = CPU::from_ops(vec![
+        let mut cpu = Pic12F508::from_ops(vec![
             OpCode::MOVLW { k: 0x55 },
             OpCode::MOVWF { f: PCL as u8 },
         ]);
@@ -1046,7 +1053,7 @@ mod tests {
         // so we have to track every "write" to PC, regardless
         // of the value written. This is done manually in any instruction
         // that modifies the PC
-        let mut cpu = CPU::from_ops(vec![OpCode::GOTO { k: 0 }]);
+        let mut cpu = Pic12F508::from_ops(vec![OpCode::GOTO { k: 0 }]);
         cpu.tick();
         assert_eq!(cpu.pc, 0);
         assert_eq!(cpu.next_op, None);
@@ -1065,7 +1072,7 @@ mod tests {
 :00000001FF
 ";
         let contents = HEX;
-        let cpu: CPU = CPU::from_hex(&contents);
+        let cpu: Pic12F508 = Pic12F508::from_hex(&contents);
         let mut cpu = test::black_box(cpu);
         b.iter(|| cpu.tick());
     }
@@ -1074,8 +1081,15 @@ mod tests {
         use super::*;
 
         #[test]
+        fn gpio_writes_pin_values_not_latch() {
+            todo!("When an I/O register is modified as a function of itself (e.g. MOVF PORTB, 1), the value used will be that
+            value present on the pins themselves. For example, if the data latch is ‘1’ for a pin configured as input and
+            is driven low by an external device, the data will be written back with a ‘0’.");
+        }
+
+        #[test]
         fn weak_pull_ups_set_input() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b00111111 },
                 OpCode::OPTION,
                 OpCode::MOVLW { k: 0b01111111 },
@@ -1090,10 +1104,7 @@ mod tests {
 
         #[test]
         fn weak_pull_ups_set_low_is_low() {
-            let mut cpu = CPU::from_ops(vec![
-                OpCode::MOVLW { k: 0b00111111 },
-                OpCode::OPTION,
-            ]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0b00111111 }, OpCode::OPTION]);
             assert_eq!(cpu.gpio, 0x0);
             cpu.run(2);
             assert_eq!(cpu.gpio, 0x0b);
@@ -1111,7 +1122,7 @@ mod tests {
 
         #[test]
         fn write_gpio_sets_outputs() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::CLRW,
                 OpCode::TRIS { f: GPIO as u8 },
                 OpCode::BSF {
@@ -1161,15 +1172,35 @@ mod tests {
 
         #[test]
         fn clock_is_off_normally() {
-            let mut cpu = CPU::from_ops(vec![OpCode::GOTO { k: 0 }]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::GOTO { k: 0 }]);
             assert_eq!(cpu.tmr0, 0);
             cpu.run(100);
             assert_eq!(cpu.tmr0, 0);
         }
 
+
+        #[test]
+        fn write_tmr0_clears_prescaler() {
+            let mut cpu = Pic12F508::from_ops(vec![
+                OpCode::MOVLW { k: 0b11010111 }, // start timer with 1:256 prescale
+                OpCode::OPTION,
+                OpCode::MOVLW { k: 0xf0 },
+                OpCode::MOVWF { f: 0x10 },
+                OpCode::DECFSZ { f: 0x10, d: true },
+                OpCode::GOTO { k: 4 },
+                OpCode::CLRF { f: TMR0 as u8 },
+            ]);
+            assert_eq!(cpu.tmr0, 0);
+            while cpu.pc < 7 {
+                cpu.tick();
+            }
+            assert_eq!(cpu.prescaler, 0);
+            
+        }
+
         #[test]
         fn write_tmr0_when_disabled() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 100 },
                 OpCode::MOVWF { f: TMR0 as u8 },
             ]);
@@ -1179,7 +1210,7 @@ mod tests {
 
         #[test]
         fn clock_inc_one_per_cycle() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11011000 }, // start timer
                 OpCode::OPTION,
             ]);
@@ -1198,7 +1229,7 @@ mod tests {
 
         #[test]
         fn tmr_inhibit_2cycles_after_write() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11011000 }, // start timer
                 OpCode::OPTION,
                 OpCode::NOP,
@@ -1247,7 +1278,7 @@ mod tests {
 
         #[test]
         fn tmr_1to2_prescaler() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11010000 }, // start timer with 1:2 prescale
                 OpCode::OPTION,
                 OpCode::MOVLW { k: 100 },
@@ -1300,7 +1331,7 @@ mod tests {
 
         #[test]
         fn tmr_1to4_prescaler() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11010001 }, // start timer with 1:4 prescale
                 OpCode::OPTION,
                 OpCode::NOP,
@@ -1353,7 +1384,7 @@ mod tests {
 
         #[test]
         fn tmr_1to256_prescaler() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11010111 }, // start timer with 1:4 prescale
                 OpCode::OPTION,
                 OpCode::MOVF {
@@ -1381,7 +1412,7 @@ mod tests {
 
         #[test]
         fn read_indf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0x55 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x10 },
@@ -1397,7 +1428,7 @@ mod tests {
         }
         #[test]
         fn read_status_indf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: STATUS as u8 },
                 OpCode::MOVWF { f: FSR as u8 },
                 OpCode::CLRW,
@@ -1414,7 +1445,7 @@ mod tests {
 
         #[test]
         fn write_gpio_indf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: GPIO as u8 },
                 OpCode::MOVWF { f: FSR as u8 },
                 OpCode::CLRW,
@@ -1444,7 +1475,7 @@ mod tests {
                 wdte: false,
                 fosc: CfgFosc::INTRC,
             };
-            let mut cpu = CPU::from_ops_and_cfg(
+            let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
                     OpCode::MOVLW { k: 0b1100_1000 },
                     OpCode::OPTION,
@@ -1482,7 +1513,7 @@ mod tests {
                 wdte: false,
                 fosc: CfgFosc::INTRC,
             };
-            let mut cpu = CPU::from_ops_and_cfg(vec![OpCode::NOP, OpCode::SLEEP], cfg);
+            let mut cpu = Pic12F508::from_ops_and_cfg(vec![OpCode::NOP, OpCode::SLEEP], cfg);
             assert!(cpu.config.is_mclr_enabled());
             cpu.run(2);
             assert_eq!(cpu.state, CpuState::Sleep);
@@ -1509,7 +1540,7 @@ mod tests {
                 wdte: true,
                 fosc: CfgFosc::INTRC,
             };
-            let mut cpu = CPU::from_ops_and_cfg(
+            let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
                     OpCode::MOVLW { k: 0b1100_1000 },
                     OpCode::OPTION,
@@ -1533,7 +1564,7 @@ mod tests {
                 wdte: false,
                 fosc: CfgFosc::INTRC,
             };
-            let mut cpu = CPU::from_ops_and_cfg(
+            let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
                     OpCode::MOVLW { k: 0b1100_1000 },
                     OpCode::OPTION,
@@ -1549,7 +1580,7 @@ mod tests {
 
         #[test]
         fn por_registers_are_correct() {
-            let mut cpu = CPU::new();
+            let mut cpu = Pic12F508::new();
             cpu.reset(ResetReason::POR);
             assert_eq!(cpu.w, OSC_CALIB_VALUE);
             // indf is undefined
@@ -1565,7 +1596,7 @@ mod tests {
 
         #[test]
         fn mclr_status_correct() {
-            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::CLRW]); // sets Z-flag
             cpu.run(1);
             let bits_before = cpu.status & 0b0001_1111;
             cpu.reset(ResetReason::MCLR);
@@ -1574,7 +1605,7 @@ mod tests {
 
         #[test]
         fn mclr_sleep_status_correct() {
-            let mut cpu = CPU::from_ops(vec![OpCode::CLRW, OpCode::SLEEP]); // sets Z-flag
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::CLRW, OpCode::SLEEP]); // sets Z-flag
             cpu.run(2);
             let bits_before = cpu.status & 0b0001_1111;
             cpu.reset(ResetReason::MCLRSleep);
@@ -1582,8 +1613,25 @@ mod tests {
         }
 
         #[test]
+        fn wdt_reset_resets_prescaler() {
+            let mut cpu: Pic12F508 = Pic12F508::from_ops_and_cfg(
+                vec![OpCode::GOTO { k: 0 }],
+                ConfigWord {
+                    mclre: true,
+                    cp_disable: true,
+                    wdte: true,
+                    fosc: CfgFosc::INTRC,
+                },
+            );
+            cpu.run(2304126);
+            assert_eq!(cpu.last_reset_reason, ResetReason::WDT);
+            cpu.reset(ResetReason::POR);
+            cpu.run(2304126);
+        }
+
+        #[test]
         fn wdt_status_correct() {
-            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::CLRW]); // sets Z-flag
             cpu.run(1);
             let bits_before = cpu.status & 0b0000_1111;
             cpu.reset(ResetReason::WDT);
@@ -1593,7 +1641,7 @@ mod tests {
 
         #[test]
         fn wdt_sleep_status_correct() {
-            let mut cpu = CPU::from_ops(vec![OpCode::CLRW]); // sets Z-flag
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::CLRW]); // sets Z-flag
             cpu.run(1);
             let bits_before = cpu.status & 0b0000_0111;
             cpu.reset(ResetReason::WDTSleep);
@@ -1610,7 +1658,7 @@ mod tests {
                 wdte: false,
                 fosc: CfgFosc::INTRC,
             };
-            let mut cpu = CPU::from_ops_and_cfg(
+            let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![OpCode::MOVLW { k: 0 }, OpCode::OPTION, OpCode::SLEEP],
                 cfg,
             );
@@ -1633,7 +1681,7 @@ mod tests {
 
         #[test]
         fn addwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x60 },
@@ -1653,7 +1701,7 @@ mod tests {
 
         #[test]
         fn andwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaf },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x55 },
@@ -1670,7 +1718,7 @@ mod tests {
 
         #[test]
         fn clrf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::CLRF { f: 0x10 },
@@ -1684,7 +1732,7 @@ mod tests {
 
         #[test]
         fn clrw() {
-            let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xa5 }, OpCode::CLRW]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0xa5 }, OpCode::CLRW]);
             cpu.tick();
             cpu.tick();
             assert_eq!(cpu.w, 0);
@@ -1693,7 +1741,7 @@ mod tests {
 
         #[test]
         fn comf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xa5 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::COMF { f: 0x10, d: true },
@@ -1733,7 +1781,7 @@ mod tests {
             // DECF one more time to wrap to 0xff, and store in W
             ops.push(OpCode::DECF { f: 0x10, d: false });
 
-            let mut cpu = CPU::from_ops(ops);
+            let mut cpu = Pic12F508::from_ops(ops);
             cpu.run(3);
             for n in 0..255 {
                 cpu.tick();
@@ -1747,7 +1795,7 @@ mod tests {
 
         #[test]
         fn decfsz() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 2 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::DECFSZ { f: 0x10, d: true },
@@ -1783,7 +1831,7 @@ mod tests {
             // INCF one more time to wrap to 0x0, and store in W
             ops.push(OpCode::INCF { f: 0x10, d: false });
 
-            let mut cpu = CPU::from_ops(ops);
+            let mut cpu = Pic12F508::from_ops(ops);
             cpu.run(3);
             for n in 0..255 {
                 assert_eq!(n, cpu.sram[0x10]);
@@ -1798,7 +1846,7 @@ mod tests {
 
         #[test]
         fn incfsz() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xfe },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::INCFSZ { f: 0x10, d: true },
@@ -1820,7 +1868,7 @@ mod tests {
 
         #[test]
         fn iorwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x55 },
@@ -1842,7 +1890,7 @@ mod tests {
 
         #[test]
         fn movf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVF { f: 0x10, d: true }, // affect Z flag
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
@@ -1858,7 +1906,7 @@ mod tests {
 
         #[test]
         fn movwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0x55 },
@@ -1881,7 +1929,7 @@ mod tests {
         #[test]
         fn nop() {
             // Test that nothing happens
-            let mut cpu = CPU::from_ops(vec![OpCode::NOP]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::NOP]);
             let status = cpu.status;
             cpu.tick();
             assert_eq!(cpu.status, status);
@@ -1889,7 +1937,7 @@ mod tests {
 
         #[test]
         fn rlf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0x55 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::RLF { f: 0x10, d: true },
@@ -1909,7 +1957,7 @@ mod tests {
 
         #[test]
         fn rrf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::RRF { f: 0x10, d: true },
@@ -1929,7 +1977,7 @@ mod tests {
 
         #[test]
         fn subwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::SUBWF { f: 0x10, d: true },
@@ -1946,7 +1994,7 @@ mod tests {
 
         #[test]
         fn swapf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xa5 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::SWAPF { f: 0x10, d: true },
@@ -1964,7 +2012,7 @@ mod tests {
 
         #[test]
         fn xorwf() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xa5 },
                 OpCode::MOVWF { f: 0x10 },
                 OpCode::MOVLW { k: 0xa0 },
@@ -1984,7 +2032,7 @@ mod tests {
             let mut ops = vec![OpCode::MOVLW { k: 0xff }, OpCode::MOVWF { f: 0x10 }];
             let mut ops2: Vec<OpCode> = (0..8).map(|i| OpCode::BCF { f: 0x10, b: i }).collect();
             ops.append(&mut ops2);
-            let mut cpu = CPU::from_ops(ops);
+            let mut cpu = Pic12F508::from_ops(ops);
             cpu.run(2);
             let mut expected = 0xff;
             for i in 0..8 {
@@ -1997,7 +2045,7 @@ mod tests {
         #[test]
         fn bsf() {
             let ops: Vec<OpCode> = (0..8).map(|i| OpCode::BSF { f: 0x10, b: i }).collect();
-            let mut cpu = CPU::from_ops(ops);
+            let mut cpu = Pic12F508::from_ops(ops);
             let mut expected = 0;
             for i in 0..8 {
                 cpu.tick();
@@ -2008,7 +2056,7 @@ mod tests {
 
         #[test]
         fn btfsc() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::BTFSC { f: 0x10, b: 0 },
                 OpCode::MOVLW { k: 0xaa }, // should be skipped
                 OpCode::MOVLW { k: 0x01 },
@@ -2024,7 +2072,7 @@ mod tests {
 
         #[test]
         fn btfss() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::BTFSS { f: 0x10, b: 0 },
                 OpCode::MOVLW { k: 0xaa }, // should not be skipped
                 OpCode::MOVLW { k: 0x01 },
@@ -2040,14 +2088,14 @@ mod tests {
 
         #[test]
         fn andlw() {
-            let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::ANDLW { k: 0x55 }]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::ANDLW { k: 0x55 }]);
             cpu.run(2);
             assert_eq!(cpu.w, 0x00);
         }
 
         #[test]
         fn call() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::CALL { k: 3 },
                 OpCode::SWAPF { f: 0x10, d: true },
                 OpCode::SWAPF { f: 0x10, d: true },
@@ -2071,7 +2119,7 @@ mod tests {
             // he CLRWDT instruction resets the WDT.
             // It resets the prescaler, if it's assigned to the WDT
             // Status bits TO and PD are set.
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11001000 },
                 OpCode::OPTION,
                 OpCode::CLRWDT,
@@ -2090,7 +2138,7 @@ mod tests {
 
         #[test]
         fn goto() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::GOTO { k: 4 },
                 OpCode::NOP,
                 OpCode::NOP,
@@ -2110,7 +2158,7 @@ mod tests {
 
         #[test]
         fn iorlw() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0x00 },
                 OpCode::IORLW { k: 0x00 },
                 OpCode::IORLW { k: 0xaa },
@@ -2128,7 +2176,7 @@ mod tests {
 
         #[test]
         fn movlw() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0xff },
                 OpCode::MOVLW { k: 0xaa },
                 OpCode::MOVLW { k: 0x00 },
@@ -2144,7 +2192,7 @@ mod tests {
 
         #[test]
         fn option() {
-            let mut cpu = CPU::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::OPTION]);
+            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::OPTION]);
             assert_eq!(cpu.option.bits, 0xff);
             cpu.tick();
             cpu.tick();
@@ -2153,7 +2201,7 @@ mod tests {
 
         #[test]
         fn retlw() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::CALL { k: 4 },
                 OpCode::NOP,
                 OpCode::NOP,
@@ -2172,7 +2220,7 @@ mod tests {
             0 → WDT prescaler;
             1 → TO;
             0 → PD */
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11001111 }, // assign prescaler to WDT
                 OpCode::OPTION,
                 OpCode::SLEEP,
@@ -2190,7 +2238,7 @@ mod tests {
             0 → WDT prescaler;
             1 → TO;
             0 → PD */
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b11100111 }, // assign prescaler to tmr0
                 OpCode::OPTION,
                 OpCode::SLEEP,
@@ -2206,7 +2254,7 @@ mod tests {
 
         #[test]
         fn tris() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0b010101 },
                 OpCode::TRIS { f: GPIO as u8 },
             ]);
@@ -2215,7 +2263,7 @@ mod tests {
 
         #[test]
         fn xorlw() {
-            let mut cpu = CPU::from_ops(vec![
+            let mut cpu = Pic12F508::from_ops(vec![
                 OpCode::MOVLW { k: 0x00 },
                 OpCode::XORLW { k: 0x00 },
                 OpCode::XORLW { k: 0xaa },

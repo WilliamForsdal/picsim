@@ -1,4 +1,5 @@
 #![feature(test)]
 
-pub mod cpu;
+pub mod pic12f508;
 pub mod opcode;
+pub mod instruction_sets;
