@@ -18,13 +18,13 @@ associated functions.
 * TMR0 with prescale, and 2-cycle delay after TMR0 reg write
 * Indirect adressing via INDF and FSR registers
 * STATUS bits affected by arithmetic operations
-
-## Not implemented:
 * WD timer with timeouts
 * `SLEEP` and wake from sleep
+* MCLR reset
+
+## Not implemented:
 * TMR0 in counter mode
 * config word settings
-* MCLR reset
 
 ## Fun TODOs
 * Small assembly compiler
