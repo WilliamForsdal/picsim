@@ -1,20 +1,20 @@
 use core::panic;
 
-use crate::opcode::*;
+use crate::{opcode::*, instruction_sets::Baseline};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CfgFosc {
-    EXTRC,
-    INTRC,
-    XT,
-    LP,
+pub enum ClockSource {
+    EXTRC,  // External RC oscillator
+    INTRC,  // Internal RC oscillator
+    XT,     // ?
+    LP,     // ?
 }
 
 pub struct ConfigWord {
     pub mclre: bool,
     pub cp_disable: bool,
     pub wdte: bool,
-    pub fosc: CfgFosc,
+    pub fosc: ClockSource,
 }
 
 impl ConfigWord {
@@ -30,7 +30,7 @@ impl ConfigWord {
             mclre: false,
             cp_disable: true,
             wdte: false,
-            fosc: CfgFosc::INTRC,
+            fosc: ClockSource::INTRC,
         }
     }
     pub fn from_value(value: u16) -> ConfigWord {
@@ -43,10 +43,10 @@ impl ConfigWord {
             cp_disable: (value >> CP) & 1 > 0,
             wdte: (value >> WDTE) & 1 > 0,
             fosc: match value & FOCS_MASK {
-                0b00 => CfgFosc::LP,
-                0b01 => CfgFosc::XT,
-                0b10 => CfgFosc::INTRC,
-                0b11 => CfgFosc::EXTRC,
+                0b00 => ClockSource::LP,
+                0b01 => ClockSource::XT,
+                0b10 => ClockSource::INTRC,
+                0b11 => ClockSource::EXTRC,
                 _ => panic!("can't happen"),
             },
         }
@@ -73,6 +73,13 @@ pub fn bit_is_set(bits: u8, bit: u8) -> bool {
 
 pub fn bit_is_clear(bits: u8, bit: u8) -> bool {
     (bits & (1 << bit)) == 0
+}
+
+pub fn clear_bit(bits: u8, bit: u8) -> u8 {
+    bits & !(1<<bit)
+}
+pub fn set_bit(bits: u8, bit: u8) -> u8 {
+    bits | (1<<bit)
 }
 
 pub struct OptionReg {
@@ -110,8 +117,6 @@ impl OptionReg {
         1 << ((self.bits & 7) + 1)
     }
 }
-
-pub const PIN_MCLR: u8 = 3;
 
 pub struct Pic12F508 {
     pub ticks: u64,
@@ -188,14 +193,20 @@ enum StatusBit {
     Z,
     PD,
     TO,
-    PA0,
-    GPWUF,
+
+    // Program page select bit PA0 is unused in PIC12F508
+    // In 12F508, the datasheet says it's possible to use
+    // this bit as a general purpose R/W bit, but it's not
+    // recommended for upwards compatibility.
+    // PA0, 
+    // GPIO reset bit
+    // GPWUF,  
 }
 
 impl Pic12F508 {
     pub fn from_hex(program: &str) -> Pic12F508 {
         let (flash, cfg_word) = OpCode::from_hex(program);
-        Pic12F508::new_from_flash(flash, ConfigWord::default())
+        Pic12F508::new_from_flash(flash, ConfigWord::from_value(cfg_word))
     }
 
     pub fn from_asm(asm: &str) -> Pic12F508 {
@@ -224,7 +235,7 @@ impl Pic12F508 {
     }
 
     fn new_from_flash(flash: [u16; 512], cfg_word: ConfigWord) -> Pic12F508 {
-        if cfg_word.fosc != CfgFosc::INTRC {
+        if cfg_word.fosc != ClockSource::INTRC {
             panic!("Only INTRC implemented.");
         }
         let mut cpu = Pic12F508 {
@@ -345,8 +356,8 @@ impl Pic12F508 {
                 StatusBit::Z => 2,
                 StatusBit::PD => 3,
                 StatusBit::TO => 4,
-                StatusBit::PA0 => 5,
-                StatusBit::GPWUF => 7,
+                // StatusBit::PA0 => 5,
+                // StatusBit::GPWUF => 7,
             };
         if val {
             self.status |= bit_mask;
@@ -371,12 +382,13 @@ impl Pic12F508 {
     fn affect_to(&mut self, val: bool) {
         self.affect_status_flag(StatusBit::TO, val);
     }
-    fn affect_pa0(&mut self, val: bool) {
-        self.affect_status_flag(StatusBit::PA0, val);
-    }
-    fn affect_gpwuf(&mut self, val: bool) {
-        self.affect_status_flag(StatusBit::GPWUF, val);
-    }
+    // fn affect_pa0(&mut self, val: bool) {
+    //     self.affect_status_flag(StatusBit::PA0, val);
+    // }
+
+    // fn affect_gpwuf(&mut self, val: bool) {
+    //     self.affect_status_flag(StatusBit::GPWUF, val);
+    // }
 
     fn fetch(&self, pc: u16) -> u16 {
         self.flash[(pc & 0x1ff) as usize]
@@ -584,13 +596,16 @@ impl Pic12F508 {
     fn set_gpio_inputs(&mut self) {
         for input in 0..6 {
             let mask = 1 << input;
-            if (self.trisgpio & mask) != 0 || (input == PIN_MCLR && self.config.is_mclr_enabled()) {
+            if (self.trisgpio & mask) != 0 // if this pin is an input
+            || (input == 3 && self.config.is_mclr_enabled()) { // or is MCLRE
                 match self.input_buffer[input as usize] {
                     Input::Floating => {
                         if self.is_pin_pulled_up(input) {
                             self.gpio |= mask;
                         } else {
-                            self.gpio &= !mask;
+                            // set it to low if the pin is floating.
+                            // todo!("Maybe randomly 0/1?");
+                            self.gpio &= !mask; 
                         }
                     }
                     Input::Low => {
@@ -644,7 +659,9 @@ impl Pic12F508 {
             OpCode::SLEEP => self.sleep(),
             OpCode::TRIS { f } => self.tris(f),
             OpCode::XORLW { k } => self.xorlw(k),
-            OpCode::INVALID { code } => self.invalid(code),
+            OpCode::INVALID { code } => {
+                println!("ERROR: Executed invalid instruction 0x{code:03x} as NOP,. PC={}", self.pc-1);
+            }
         }
     }
 
@@ -718,7 +735,7 @@ impl Pic12F508 {
 }
 
 // Instructions
-impl Pic12F508 {
+impl Baseline for Pic12F508 {
     fn addwf(&mut self, f: u8, d: bool) {
         let a = self.sram[f as usize];
         let b = self.w;
@@ -1010,9 +1027,6 @@ impl Pic12F508 {
         self.affect_zero(self.w == 0);
     }
 
-    fn invalid(&self, code: u16) {
-        println!("ERROR: Executed invalid instruction {code:03x} as NOP");
-    }
 }
 
 #[cfg(test)]
@@ -1080,12 +1094,12 @@ mod tests {
     mod gpio {
         use super::*;
 
-        #[test]
-        fn gpio_writes_pin_values_not_latch() {
-            todo!("When an I/O register is modified as a function of itself (e.g. MOVF PORTB, 1), the value used will be that
-            value present on the pins themselves. For example, if the data latch is ‘1’ for a pin configured as input and
-            is driven low by an external device, the data will be written back with a ‘0’.");
-        }
+        // #[test]
+        // fn gpio_writes_pin_values_not_latch() {
+        //     todo!("When an I/O register is modified as a function of itself (e.g. MOVF PORTB, 1), the value used will be that
+        //     value present on the pins themselves. For example, if the data latch is ‘1’ for a pin configured as input and
+        //     is driven low by an external device, the data will be written back with a ‘0’.");
+        // }
 
         #[test]
         fn weak_pull_ups_set_input() {
@@ -1473,7 +1487,7 @@ mod tests {
                 mclre: true,
                 cp_disable: true,
                 wdte: false,
-                fosc: CfgFosc::INTRC,
+                fosc: ClockSource::INTRC,
             };
             let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
@@ -1511,7 +1525,7 @@ mod tests {
                 mclre: true,
                 cp_disable: true,
                 wdte: false,
-                fosc: CfgFosc::INTRC,
+                fosc: ClockSource::INTRC,
             };
             let mut cpu = Pic12F508::from_ops_and_cfg(vec![OpCode::NOP, OpCode::SLEEP], cfg);
             assert!(cpu.config.is_mclr_enabled());
@@ -1538,7 +1552,7 @@ mod tests {
                 mclre: false,
                 cp_disable: true,
                 wdte: true,
-                fosc: CfgFosc::INTRC,
+                fosc: ClockSource::INTRC,
             };
             let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
@@ -1562,7 +1576,7 @@ mod tests {
                 mclre: false,
                 cp_disable: true,
                 wdte: false,
-                fosc: CfgFosc::INTRC,
+                fosc: ClockSource::INTRC,
             };
             let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![
@@ -1620,7 +1634,7 @@ mod tests {
                     mclre: true,
                     cp_disable: true,
                     wdte: true,
-                    fosc: CfgFosc::INTRC,
+                    fosc: ClockSource::INTRC,
                 },
             );
             cpu.run(2304126);
@@ -1656,7 +1670,7 @@ mod tests {
                 mclre: true,
                 cp_disable: true,
                 wdte: false,
-                fosc: CfgFosc::INTRC,
+                fosc: ClockSource::INTRC,
             };
             let mut cpu = Pic12F508::from_ops_and_cfg(
                 vec![OpCode::MOVLW { k: 0 }, OpCode::OPTION, OpCode::SLEEP],

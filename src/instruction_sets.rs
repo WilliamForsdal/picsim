@@ -37,5 +37,4 @@ pub trait Baseline {
     fn sleep(&mut self);
     fn tris(&mut self, f: u8);
     fn xorlw(&mut self, k: u8);
-    
 }

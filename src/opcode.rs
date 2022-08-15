@@ -51,11 +51,11 @@ impl OpCode {
 
         // match with longest first, then shorter
         match instruction {
-            0b0000_0100_0000 => return OpCode::CLRW,
             0b0000_0000_0000 => return OpCode::NOP,
-            0b0000_0000_0100 => return OpCode::CLRWDT,
             0b0000_0000_0010 => return OpCode::OPTION,
             0b0000_0000_0011 => return OpCode::SLEEP,
+            0b0000_0000_0100 => return OpCode::CLRWDT,
+            0b0000_0100_0000 => return OpCode::CLRW,
             _ => (),
         };
 
