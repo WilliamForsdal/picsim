@@ -1,13 +1,13 @@
 use core::panic;
 
-use crate::{opcode::*, instruction_sets::Baseline};
+use crate::{instruction_sets::Baseline, opcode::*};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClockSource {
-    EXTRC,  // External RC oscillator
-    INTRC,  // Internal RC oscillator
-    XT,     // ?
-    LP,     // ?
+    EXTRC, // External RC oscillator
+    INTRC, // Internal RC oscillator
+    XT,    // ?
+    LP,    // ?
 }
 
 pub struct ConfigWord {
@@ -76,10 +76,10 @@ pub fn bit_is_clear(bits: u8, bit: u8) -> bool {
 }
 
 pub fn clear_bit(bits: u8, bit: u8) -> u8 {
-    bits & !(1<<bit)
+    bits & !(1 << bit)
 }
 pub fn set_bit(bits: u8, bit: u8) -> u8 {
-    bits | (1<<bit)
+    bits | (1 << bit)
 }
 
 pub struct OptionReg {
@@ -193,14 +193,13 @@ enum StatusBit {
     Z,
     PD,
     TO,
-
     // Program page select bit PA0 is unused in PIC12F508
     // In 12F508, the datasheet says it's possible to use
     // this bit as a general purpose R/W bit, but it's not
     // recommended for upwards compatibility.
-    // PA0, 
+    // PA0,
     // GPIO reset bit
-    // GPWUF,  
+    // GPWUF,
 }
 
 impl Pic12F508 {
@@ -563,8 +562,8 @@ impl Pic12F508 {
             ResetReason::POR => 0b0001_1000,
             ResetReason::MCLR => status & 0b0001_1111,
             ResetReason::MCLRSleep => 0b0001_0000 | (status & 0b111),
-            ResetReason::WDT => (status & 0b1111),
-            ResetReason::WDTSleep => (status & 0b111),
+            ResetReason::WDT => status & 0b1111,
+            ResetReason::WDTSleep => status & 0b111,
             ResetReason::PinChangeSleep => 0b1001_0000 | (status & 0b111),
         };
 
@@ -573,8 +572,7 @@ impl Pic12F508 {
             self.osccal = 0b1111_1110;
             self.tmr0 = 0;
             self.prescaler = 0;
-        } 
-        else {
+        } else {
             self.fsr |= 0b1110_0000;
         }
 
@@ -597,7 +595,9 @@ impl Pic12F508 {
         for input in 0..6 {
             let mask = 1 << input;
             if (self.trisgpio & mask) != 0 // if this pin is an input
-            || (input == 3 && self.config.is_mclr_enabled()) { // or is MCLRE
+            || (input == 3 && self.config.is_mclr_enabled())
+            {
+                // or is MCLRE
                 match self.input_buffer[input as usize] {
                     Input::Floating => {
                         if self.is_pin_pulled_up(input) {
@@ -605,7 +605,7 @@ impl Pic12F508 {
                         } else {
                             // set it to low if the pin is floating.
                             // todo!("Maybe randomly 0/1?");
-                            self.gpio &= !mask; 
+                            self.gpio &= !mask;
                         }
                     }
                     Input::Low => {
@@ -660,7 +660,10 @@ impl Pic12F508 {
             OpCode::TRIS { f } => self.tris(f),
             OpCode::XORLW { k } => self.xorlw(k),
             OpCode::INVALID { code } => {
-                println!("ERROR: Executed invalid instruction 0x{code:03x} as NOP,. PC={}", self.pc-1);
+                println!(
+                    "ERROR: Executed invalid instruction 0x{code:03x} as NOP,. PC={}",
+                    self.pc - 1
+                );
             }
         }
     }
@@ -1026,7 +1029,6 @@ impl Baseline for Pic12F508 {
         self.w ^= k;
         self.affect_zero(self.w == 0);
     }
-
 }
 
 #[cfg(test)]
@@ -1118,7 +1120,8 @@ mod tests {
 
         #[test]
         fn weak_pull_ups_set_low_is_low() {
-            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0b00111111 }, OpCode::OPTION]);
+            let mut cpu =
+                Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0b00111111 }, OpCode::OPTION]);
             assert_eq!(cpu.gpio, 0x0);
             cpu.run(2);
             assert_eq!(cpu.gpio, 0x0b);
@@ -1192,7 +1195,6 @@ mod tests {
             assert_eq!(cpu.tmr0, 0);
         }
 
-
         #[test]
         fn write_tmr0_clears_prescaler() {
             let mut cpu = Pic12F508::from_ops(vec![
@@ -1209,7 +1211,6 @@ mod tests {
                 cpu.tick();
             }
             assert_eq!(cpu.prescaler, 0);
-            
         }
 
         #[test]
@@ -2102,7 +2103,8 @@ mod tests {
 
         #[test]
         fn andlw() {
-            let mut cpu = Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::ANDLW { k: 0x55 }]);
+            let mut cpu =
+                Pic12F508::from_ops(vec![OpCode::MOVLW { k: 0xaa }, OpCode::ANDLW { k: 0x55 }]);
             cpu.run(2);
             assert_eq!(cpu.w, 0x00);
         }

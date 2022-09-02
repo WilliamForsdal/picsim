@@ -1,3 +1,6 @@
+
+// This trait isn't really useful, but maybe it can be used to implement other devices.
+
 pub trait Baseline {
     // byte oriented file register operations
     fn addwf(&mut self, f: u8, d: bool);

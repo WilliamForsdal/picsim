@@ -9,12 +9,11 @@ const HEX: &str = "
 ";
 
 fn main() {
-    let (ops, cfg) = OpCode::from_hex(HEX);
-    for op in ops {    
-        let decoded = OpCode::decode(op);
-        println!("{decoded:?}");
-    }
-    return ;
+    // let (ops, cfg) = OpCode::from_hex(HEX);
+    // for op in ops {    
+    //     let decoded = OpCode::decode(op);
+    //     println!("{decoded:?}");
+    // }
     let mut cpu: Pic12F508 = Pic12F508::from_hex(HEX);
     println!("w:{}, pc:{:3}, z:{}, c:{}", cpu.w, cpu.pc, cpu.status_z(), cpu.status_c());
     for _ in 0..10000 {
