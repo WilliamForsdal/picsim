@@ -9,7 +9,7 @@ Instructions in the 12F508 are 12 bits wide. These can be encoded and decoded by
 associated functions.
 
 ## Implemented:
-* All instructions (except `SLEEP` and `CLRWDT`) of the pic baseline instruction set (33 instructions)
+* All instructions of the pic baseline instruction set (33 instructions)
 * Instruction encoding (to 12-bit words) and decoding (to structs in rust)
 * Program branches and regular linear execution
 * Branches 2-cycle delay
