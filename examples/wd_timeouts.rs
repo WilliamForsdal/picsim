@@ -22,5 +22,8 @@ fn main() {
         let ticks_this_iteration = elapsed.as_micros() - ticks; 
         ticks += ticks_this_iteration;
         cpu.run(ticks_this_iteration as u32);
+        if elapsed.as_secs_f64() > 5 as f64 {
+            break;
+        }
     }
 }

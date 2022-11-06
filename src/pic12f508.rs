@@ -126,7 +126,6 @@ pub struct Pic12F508 {
     // None at first tick, or after branch
     pub next_op: Option<OpCode>,
 
-    pc_written: bool,
 
     pub config: ConfigWord,
     pub flash: [u16; 512], // actually 12 bit words
@@ -137,6 +136,8 @@ pub struct Pic12F508 {
 
     // Remember to set pc_written when writing to PC
     pub pc: u16, // actually 10 bits for real
+    pc_written: bool,
+    
     pub option: OptionReg,
     pub trisgpio: u8, // not a memory mapped register
 
